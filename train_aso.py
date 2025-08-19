@@ -28,7 +28,7 @@ from rinalmo.utils.finetune_callback import GradualUnfreezing
 
 
 class ASOInhibitionHead(nn.Module):
-    """Simple MLP head for ASO inhibition prediction"""
+    """Simple MLP head for ASO inhibition prediction with dosage input"""
     def __init__(
         self,
         c_in: int,
@@ -40,7 +40,8 @@ class ASOInhibitionHead(nn.Module):
 
         layers = []
         for i in range(num_layers):
-            in_dim = c_in if i == 0 else hidden_dim
+            # Add 1 to input dimension for dosage in first layer
+            in_dim = c_in + 1 if i == 0 else hidden_dim
             out_dim = 1 if i == num_layers - 1 else hidden_dim
 
             layers.append(nn.Linear(in_dim, out_dim))
@@ -51,16 +52,18 @@ class ASOInhibitionHead(nn.Module):
 
         self.mlp = nn.Sequential(*layers)
 
-    def forward(self, x, pad_mask):
+    def forward(self, x, pad_mask, dosage):
         # Average pooling over sequence length (excluding padding)
         lengths = (~pad_mask).sum(dim=1, keepdim=True).float()
         x_sum = x.sum(dim=1)
         x_mean = x_sum / lengths.clamp(min=1.0)
 
-        # Pass through MLP
-        out = self.mlp(x_mean)
-        return out.squeeze(-1)
+        # Concatenate sequence representation with dosage
+        x_with_dosage = torch.cat([x_mean, dosage.unsqueeze(-1)], dim=-1)
 
+        # Pass through MLP
+        out = self.mlp(x_with_dosage)
+        return out.squeeze(-1)
 
 class ASOInhibitionPredictionWrapper(pl.LightningModule):
     def __init__(
@@ -80,10 +83,9 @@ class ASOInhibitionPredictionWrapper(pl.LightningModule):
 
         self.pred_head = ASOInhibitionHead(
             c_in=self.lm.config['model']['transformer'].embed_dim,
-            hidden_dim=hidden_dim,
-            num_layers=num_layers,
             dropout=dropout
         )
+
 
         self.loss = nn.MSELoss()
         self.r2_metric = R2Score()
@@ -100,24 +102,24 @@ class ASOInhibitionPredictionWrapper(pl.LightningModule):
 
     def load_pretrained_lm_weights(self, pretrained_weights_path):
         self.lm.load_state_dict(torch.load(pretrained_weights_path))
-
-    def forward(self, tokens):
+    
+    def forward(self, tokens, dosage):
         x = self.lm(tokens)["representation"]
 
         # Nullify padding token representations
         pad_mask = tokens.eq(self.pad_idx)
         x[pad_mask, :] = 0.0
 
-        pred = self.pred_head(x, pad_mask)
+        pred = self.pred_head(x, pad_mask, dosage)
         return pred
 
     def fit_scaler(self, batch):
-        _, inhibition, _ = batch  # Unpack with custom_id
+        _, inhibition, _, _ = batch  # Updated unpacking
         self.scaler.partial_fit(inhibition)
 
     def _common_step(self, batch, batch_idx, log_prefix: str):
-        seq_encoded, inhibition_target, custom_ids = batch
-        preds = self(seq_encoded)
+        seq_encoded, inhibition_target, dosage, custom_ids = batch  # Updated unpacking
+        preds = self(seq_encoded, dosage)
 
         # Scale targets and compute loss
         scaled_inhibition_target = self.scaler.transform(inhibition_target)

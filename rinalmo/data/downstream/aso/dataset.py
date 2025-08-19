@@ -29,15 +29,15 @@ class ASODataset(Dataset):
         self.df = self.df.dropna(subset=['inhibition_percent'])
         self.df = self.df.reset_index(drop=True)
 
+        # Calculate median dosage for imputation
+        self.median_dosage = self.df['dosage'].median()
+        
         self.alphabet = alphabet
 
         self.max_enc_seq_len = -1
         if pad_to_max_len:
             # Add 2 for special tokens (CLS/EOS)
             self.max_enc_seq_len = self.df['rna_sequence'].str.len().max() + 2
-
-    def __len__(self):
-        return len(self.df)
 
     def __getitem__(self, idx):
         df_row = self.df.iloc[idx]
@@ -48,14 +48,18 @@ class ASODataset(Dataset):
             dtype=torch.long
         )
 
-        # Normalize inhibition_percent to 0-1 range for better training stability
-        # We'll denormalize in the model wrapper
+        # Normalize inhibition_percent to 0-1 range
         inhibition = torch.tensor(df_row['inhibition_percent'] / 100.0, dtype=torch.float32)
+
+        # Get dosage, impute with median if missing
+        dosage = df_row['dosage'] if pd.notna(df_row['dosage']) else self.median_dosage
+        dosage = torch.tensor(dosage, dtype=torch.float32)
 
         # Also return custom_id for validation grouping
         custom_id = df_row['custom_id']
 
-        return seq_encoded, inhibition, custom_id
+        return seq_encoded, inhibition, dosage, custom_id
+
 
     def train_val_test_split(self, train_ratio: float = 0.8, val_ratio: float = 0.1, random_state: int = 42):
         """
