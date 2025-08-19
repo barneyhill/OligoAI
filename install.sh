@@ -1,5 +1,4 @@
-git clone https://github.com/barneyhill/RiNALMo
-cd RiNALMo
+apt-get update; apt-get install vim
 pip install .
 pip install flash-attn==2.3.2 -U --force-reinstall
 pip install pandas scipy
