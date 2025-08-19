@@ -21,34 +21,34 @@ class ASODataModule(pl.LightningDataModule):
         random_state: int = 42,
     ):
         super().__init__()
-        
+
         self.data_path = Path(data_path)
         self.alphabet = alphabet
-        
+
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.pin_memory = pin_memory
-        
+
         self.train_ratio = train_ratio
         self.val_ratio = val_ratio
         self.random_state = random_state
-    
+
     def setup(self, stage: Optional[str] = None):
         dataset = ASODataset(
-            self.data_path, 
+            self.data_path,
             alphabet=self.alphabet,
             pad_to_max_len=True
         )
-        
+
         self.train_dataset, self.val_dataset, self.test_dataset = dataset.train_val_test_split(
             train_ratio=self.train_ratio,
             val_ratio=self.val_ratio,
             random_state=self.random_state
         )
-        
+
         print(f"Dataset sizes - Train: {len(self.train_dataset)}, Val: {len(self.val_dataset)}, Test: {len(self.test_dataset)}")
         print(f"Max sequence length: {dataset.max_enc_seq_len}")
-    
+
     def train_dataloader(self):
         return DataLoader(
             self.train_dataset,
@@ -57,7 +57,7 @@ class ASODataModule(pl.LightningDataModule):
             pin_memory=self.pin_memory,
             shuffle=True
         )
-    
+
     def val_dataloader(self):
         return DataLoader(
             self.val_dataset,
@@ -66,7 +66,7 @@ class ASODataModule(pl.LightningDataModule):
             pin_memory=self.pin_memory,
             shuffle=False
         )
-    
+
     def test_dataloader(self):
         return DataLoader(
             self.test_dataset,

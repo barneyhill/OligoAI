@@ -1,0 +1,14 @@
+# ft_schedules/micro_aso_ft.yaml
+0:
+    - pred_head.*
+3:
+    - lm.transformer.final_layer_norm.*
+    - lm.transformer.blocks.(1[0-1]).*
+6:
+    - lm.transformer.blocks.([8-9]).*
+9:
+    - lm.transformer.blocks.([6-7]).*
+12:
+    - lm.transformer.blocks.([4-5]).*
+15:
+    - lm.transformer.blocks.([0-3]).*

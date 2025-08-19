@@ -15,6 +15,9 @@ from torchmetrics.regression import R2Score, MeanAbsoluteError, MeanSquaredError
 
 import argparse
 from pathlib import Path
+from collections import defaultdict
+import numpy as np
+from scipy.stats import spearmanr
 
 from rinalmo.config import model_config
 from rinalmo.model.model import RiNALMo
@@ -34,26 +37,26 @@ class ASOInhibitionHead(nn.Module):
         dropout: float = 0.1,
     ):
         super().__init__()
-        
+
         layers = []
         for i in range(num_layers):
             in_dim = c_in if i == 0 else hidden_dim
             out_dim = 1 if i == num_layers - 1 else hidden_dim
-            
+
             layers.append(nn.Linear(in_dim, out_dim))
-            
+
             if i < num_layers - 1:  # Don't add activation/dropout after last layer
                 layers.append(nn.ReLU())
                 layers.append(nn.Dropout(dropout))
-        
+
         self.mlp = nn.Sequential(*layers)
-    
+
     def forward(self, x, pad_mask):
         # Average pooling over sequence length (excluding padding)
         lengths = (~pad_mask).sum(dim=1, keepdim=True).float()
         x_sum = x.sum(dim=1)
         x_mean = x_sum / lengths.clamp(min=1.0)
-        
+
         # Pass through MLP
         out = self.mlp(x_mean)
         return out.squeeze(-1)
@@ -70,124 +73,164 @@ class ASOInhibitionPredictionWrapper(pl.LightningModule):
     ):
         super().__init__()
         self.save_hyperparameters()
-        
+
         self.scaler = StandardScaler()
-        
+
         self.lm = RiNALMo(model_config(lm_config))
-        
+
         self.pred_head = ASOInhibitionHead(
             c_in=self.lm.config['model']['transformer'].embed_dim,
             hidden_dim=hidden_dim,
             num_layers=num_layers,
             dropout=dropout
         )
-        
+
         self.loss = nn.MSELoss()
         self.r2_metric = R2Score()
         self.mae_metric = MeanAbsoluteError()
         self.rmse_metric = MeanSquaredError(squared=False)
-        
+
         self.lr = lr
-        
+
         self.pad_idx = self.lm.config['model']['embedding'].padding_idx
-    
+        
+        # For collecting validation data by custom_id
+        self.val_data_by_custom_id = defaultdict(lambda: {'preds': [], 'targets': []})
+        self.test_data_by_custom_id = defaultdict(lambda: {'preds': [], 'targets': []})
+
     def load_pretrained_lm_weights(self, pretrained_weights_path):
         self.lm.load_state_dict(torch.load(pretrained_weights_path))
-    
+
     def forward(self, tokens):
         x = self.lm(tokens)["representation"]
-        
+
         # Nullify padding token representations
         pad_mask = tokens.eq(self.pad_idx)
         x[pad_mask, :] = 0.0
-        
+
         pred = self.pred_head(x, pad_mask)
         return pred
-    
+
     def fit_scaler(self, batch):
-        _, inhibition = batch
+        _, inhibition, _ = batch  # Unpack with custom_id
         self.scaler.partial_fit(inhibition)
-    
+
     def _common_step(self, batch, batch_idx, log_prefix: str):
-        seq_encoded, inhibition_target = batch
+        seq_encoded, inhibition_target, custom_ids = batch
         preds = self(seq_encoded)
-        
+
         # Scale targets and compute loss
         scaled_inhibition_target = self.scaler.transform(inhibition_target)
         loss = self.loss(preds, scaled_inhibition_target)
-        
+
         # Unscale predictions for metrics (back to 0-1 range)
         preds_unscaled = self.scaler.inverse_transform(preds).clamp(min=0.0, max=1.0)
-        
+
         # Convert to percentage for interpretable metrics
         preds_percent = preds_unscaled * 100
         inhibition_percent = inhibition_target * 100
-        
+
         mse = F.mse_loss(preds_percent, inhibition_percent)
         mae = F.l1_loss(preds_percent, inhibition_percent)
-        
+
         # Update metrics
         self.r2_metric.update(preds_percent, inhibition_percent)
         self.mae_metric.update(preds_percent, inhibition_percent)
         self.rmse_metric.update(preds_percent, inhibition_percent)
-        
+
         log = {
             f'{log_prefix}/loss': loss,
             f'{log_prefix}/mse': mse,
             f'{log_prefix}/mae': mae,
         }
         self.log_dict(log, sync_dist=True)
+
+        return loss, preds_percent, inhibition_percent, custom_ids
+
+    def _eval_step(self, batch, batch_idx, log_prefix, data_collector):
+        loss, preds_percent, inhibition_percent, custom_ids = self._common_step(batch, batch_idx, log_prefix=log_prefix)
+        
+        # Collect data by custom_id for Spearman correlation calculation
+        for pred, target, custom_id in zip(preds_percent.cpu().numpy(), inhibition_percent.cpu().numpy(), custom_ids):
+            data_collector[custom_id]['preds'].append(pred)
+            data_collector[custom_id]['targets'].append(target)
         
         return loss
-    
-    def _eval_step(self, batch, batch_idx, log_prefix):
-        return self._common_step(batch, batch_idx, log_prefix=log_prefix)
-    
+
     def _on_eval_epoch_start(self):
         # Reset metric calculators
         self.r2_metric.reset()
         self.mae_metric.reset()
         self.rmse_metric.reset()
-    
-    def _on_eval_epoch_end(self, log_prefix: str):
+
+    def _calculate_mean_spearman_correlation(self, data_by_custom_id):
+        """Calculate mean Spearman correlation across all custom_ids"""
+        correlations = []
+        
+        for custom_id, data in data_by_custom_id.items():
+            preds = np.array(data['preds'])
+            targets = np.array(data['targets'])
+            
+            if len(preds) > 1:  # Need at least 2 points for correlation
+                corr, p_value = spearmanr(preds, targets)
+                if not np.isnan(corr):  # Only add valid correlations
+                    correlations.append(corr)
+        
+        if len(correlations) > 0:
+            mean_corr = np.mean(correlations)
+            return mean_corr, len(correlations)
+        else:
+            return 0.0, 0
+
+    def _on_eval_epoch_end(self, log_prefix: str, data_collector):
         # Log and reset metric calculators
         if not self.trainer.sanity_checking:
             self.log(f"{log_prefix}/r2", self.r2_metric.compute(), sync_dist=True)
             self.log(f"{log_prefix}/mae_final", self.mae_metric.compute(), sync_dist=True)
             self.log(f"{log_prefix}/rmse", self.rmse_metric.compute(), sync_dist=True)
             
+            # Calculate and log mean Spearman correlation
+            mean_spearman, n_custom_ids = self._calculate_mean_spearman_correlation(data_collector)
+            self.log(f"{log_prefix}/mean_spearman_corr", mean_spearman, sync_dist=True)
+            
+            print(f"{log_prefix} - Mean Spearman correlation: {mean_spearman:.4f} across {n_custom_ids} custom_ids")
+
             self.r2_metric.reset()
             self.mae_metric.reset()
             self.rmse_metric.reset()
-    
+            
+        # Clear the data collector
+        data_collector.clear()
+
     def training_step(self, batch, batch_idx):
         if self.current_epoch == 0:
             return self.fit_scaler(batch)
-        
-        return self._common_step(batch, batch_idx, log_prefix="train")
-    
+
+        loss, _, _, _ = self._common_step(batch, batch_idx, log_prefix="train")
+        return loss
+
     def validation_step(self, batch, batch_idx):
-        return self._eval_step(batch, batch_idx, log_prefix="val")
-    
+        return self._eval_step(batch, batch_idx, log_prefix="val", data_collector=self.val_data_by_custom_id)
+
     def on_validation_epoch_start(self):
         return self._on_eval_epoch_start()
-    
+
     def on_validation_epoch_end(self):
-        return self._on_eval_epoch_end("val")
-    
+        return self._on_eval_epoch_end("val", self.val_data_by_custom_id)
+
     def test_step(self, batch, batch_idx):
-        return self._eval_step(batch, batch_idx, log_prefix="test")
-    
+        return self._eval_step(batch, batch_idx, log_prefix="test", data_collector=self.test_data_by_custom_id)
+
     def on_test_epoch_start(self):
         return self._on_eval_epoch_start()
-    
+
     def on_test_epoch_end(self):
-        return self._on_eval_epoch_end("test")
-    
+        return self._on_eval_epoch_end("test", self.test_data_by_custom_id)
+
     def configure_optimizers(self):
         optimizer = Adam(filter(lambda p: p.requires_grad, self.parameters()), lr=self.lr)
         scheduler = LinearLR(optimizer, start_factor=1.0, end_factor=0.1, total_iters=5000)
-        
+
         return {
             "optimizer": optimizer,
             "lr_scheduler": {
@@ -200,10 +243,10 @@ class ASOInhibitionPredictionWrapper(pl.LightningModule):
 def main(args):
     if args.seed:
         pl.seed_everything(args.seed)
-    
+
     if args.output_dir:
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
-    
+
     # Model
     model = ASOInhibitionPredictionWrapper(
         lm_config=args.lm_config,
@@ -212,13 +255,13 @@ def main(args):
         dropout=args.dropout,
         lr=args.lr,
     )
-    
+
     if args.pretrained_rinalmo_weights:
         model.load_pretrained_lm_weights(args.pretrained_rinalmo_weights)
-    
+
     if args.init_params:
         model.load_state_dict(torch.load(args.init_params))
-    
+
     # Datamodule
     alphabet = Alphabet()
     datamodule = ASODataModule(
@@ -231,11 +274,11 @@ def main(args):
         val_ratio=args.val_ratio,
         random_state=args.seed if args.seed else 42,
     )
-    
+
     # Set up callbacks and loggers
     callbacks = []
     loggers = []
-    
+
     if args.wandb:
         wandb_logger = WandbLogger(
             name=args.wandb_experiment_name,
@@ -245,7 +288,7 @@ def main(args):
             save_code=True,
         )
         loggers.append(wandb_logger)
-    
+
     if args.checkpoint_every_epoch:
         epoch_ckpt_callback = ModelCheckpoint(
             dirpath=args.output_dir,
@@ -254,7 +297,7 @@ def main(args):
             save_top_k=-1
         )
         callbacks.append(epoch_ckpt_callback)
-    
+
     # Add best model checkpoint callback
     best_ckpt_callback = ModelCheckpoint(
         dirpath=args.output_dir,
@@ -264,22 +307,22 @@ def main(args):
         save_top_k=1,
     )
     callbacks.append(best_ckpt_callback)
-    
+
     if loggers:
         lr_monitor = LearningRateMonitor(logging_interval="step")
         callbacks.append(lr_monitor)
-    
+
     # Training
     strategy = 'auto'
     if args.devices != 'auto' and ("," in args.devices or (int(args.devices) > 1 and int(args.devices) != -1)):
         strategy = DDPStrategy(find_unused_parameters=True)
-    
+
     if args.ft_schedule:
         ft_callback = GradualUnfreezing(
             unfreeze_schedule_path=args.ft_schedule,
         )
         callbacks.append(ft_callback)
-    
+
     trainer = pl.Trainer(
         accelerator=args.accelerator,
         devices=args.devices,
@@ -293,16 +336,16 @@ def main(args):
         logger=loggers,
         callbacks=callbacks,
     )
-    
+
     if not args.test_only:
         trainer.fit(model=model, datamodule=datamodule)
-    
+
     trainer.test(model=model, datamodule=datamodule)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    
+
     parser.add_argument(
         "data_path", type=str,
         help="Path to the pickle file containing ASO inhibition data"
@@ -327,7 +370,7 @@ if __name__ == "__main__":
         "--test_only", action="store_true", default=False,
         help="Skip training and only run evaluation on test set"
     )
-    
+
     # Model
     parser.add_argument(
         "--lm_config", type=str, default="giga",
@@ -349,7 +392,7 @@ if __name__ == "__main__":
         "--dropout", type=float, default=0.1,
         help="Dropout rate in MLP head"
     )
-    
+
     # Data split
     parser.add_argument(
         "--train_ratio", type=float, default=0.8,
@@ -359,7 +402,7 @@ if __name__ == "__main__":
         "--val_ratio", type=float, default=0.1,
         help="Proportion of data for validation"
     )
-    
+
     # W&B
     parser.add_argument(
         "--wandb", action="store_true", default=False,
@@ -381,7 +424,7 @@ if __name__ == "__main__":
         "--log_every_n_steps", type=int, default=50,
         help="How often to log within steps"
     )
-    
+
     # Data loading
     parser.add_argument(
         "--batch_size", type=int, default=32,
@@ -395,7 +438,7 @@ if __name__ == "__main__":
         "--pin_memory", action="store_true", default=False,
         help="Pin memory for CUDA data loading"
     )
-    
+
     # Training
     parser.add_argument(
         "--ft_schedule", type=str, default=None,
@@ -429,6 +472,6 @@ if __name__ == "__main__":
         "--precision", type=str, default='16-mixed',
         help="Training precision"
     )
-    
+
     args = parser.parse_args()
     main(args)
