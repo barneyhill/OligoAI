@@ -1,7 +1,6 @@
 apt-get update; apt-get install vim
-pip install .
-pip install flash-attn==2.3.2 -U --force-reinstall
-pip install pandas scipy
+pip install torch==2.1.0 flash-attn==2.3.2 -U --force-reinstall
+pip install pandas scipy lightning wandb
 wget https://zenodo.org/records/15043668/files/rinalmo_giga_pretrained.pt # 650M params
 mkdir weights
 mv rinalmo_giga_pretrained.pt weights
