@@ -11,12 +11,7 @@ from pathlib import Path
 from rinalmo.data.alphabet import Alphabet
 
 class ASODataset(Dataset):
-    def __init__(
-        self,
-        data_path: Union[str, Path],
-        alphabet: Alphabet,
-        pad_to_max_len: bool = True,
-    ):
+    def __init__(self, data_path, alphabet, pad_to_max_len=True):
         super().__init__()
 
         # Load the CSV file
@@ -31,7 +26,7 @@ class ASODataset(Dataset):
 
         # Calculate median dosage for imputation
         self.median_dosage = self.df['dosage'].median()
-        
+
         self.alphabet = alphabet
 
         self.max_enc_seq_len = -1
@@ -39,17 +34,31 @@ class ASODataset(Dataset):
             # Add 2 for special tokens (CLS/EOS)
             self.max_enc_seq_len = self.df['rna_sequence'].str.len().max() + 2
 
+        # Calculate max length for context sequences too
+        if pad_to_max_len:
+            self.max_enc_seq_len = self.df['rna_sequence'].str.len().max() + 2
+            self.max_context_len = self.df['rna_context'].str.len().max() + 2
+
     def __getitem__(self, idx):
         df_row = self.df.iloc[idx]
 
-        seq = df_row['rna_sequence']
+        # Encode ASO sequence
         seq_encoded = torch.tensor(
-            self.alphabet.encode(seq, pad_to_len=self.max_enc_seq_len),
+            self.alphabet.encode(df_row['rna_sequence'], pad_to_len=self.max_enc_seq_len),
             dtype=torch.long
         )
 
-        # Normalize inhibition_percent to 0-1 range
-        inhibition = torch.tensor(df_row['inhibition_percent'] / 100.0, dtype=torch.float32)
+        # Encode masked context
+        context_encoded = torch.tensor(
+            self.alphabet.encode(df_row['rna_context'], pad_to_len=self.max_context_len),
+            dtype=torch.long
+        )
+
+        # Replace 'Z' tokens with actual mask tokens
+        # 'Z' will be encoded as UNK_TKN, so replace UNK indices with MASK indices
+        context_encoded[context_encoded == self.alphabet.unk_idx] = self.alphabet.mask_idx
+
+        inhibition = torch.tensor(df_row['inhibition_percent'], dtype=torch.float32)
 
         # Get dosage, impute with median if missing
         dosage = df_row['dosage'] if pd.notna(df_row['dosage']) else self.median_dosage
@@ -58,8 +67,7 @@ class ASODataset(Dataset):
         # Also return custom_id for validation grouping
         custom_id = df_row['custom_id']
 
-        return seq_encoded, inhibition, dosage, custom_id
-
+        return seq_encoded, context_encoded, inhibition, dosage, df_row['custom_id']
 
     def train_val_test_split(self, train_ratio: float = 0.8, val_ratio: float = 0.1, random_state: int = 42):
         """
@@ -72,30 +80,30 @@ class ASODataset(Dataset):
             random_state: Random seed for reproducibility
         """
         np.random.seed(random_state)
-        
+
         # Get unique custom_ids and shuffle them
         unique_custom_ids = self.df['custom_id'].unique()
         n_custom_ids = len(unique_custom_ids)
         shuffled_custom_ids = np.random.permutation(unique_custom_ids)
-        
+
         # Calculate split sizes
         train_size = int(train_ratio * n_custom_ids)
         val_size = int(val_ratio * n_custom_ids)
-        
+
         # Split custom_ids
         train_custom_ids = shuffled_custom_ids[:train_size]
         val_custom_ids = shuffled_custom_ids[train_size:train_size + val_size]
         test_custom_ids = shuffled_custom_ids[train_size + val_size:]
-        
+
         # Get indices for each split
         train_indices = self.df[self.df['custom_id'].isin(train_custom_ids)].index.tolist()
         val_indices = self.df[self.df['custom_id'].isin(val_custom_ids)].index.tolist()
         test_indices = self.df[self.df['custom_id'].isin(test_custom_ids)].index.tolist()
-        
+
         print(f"Split by custom_id - Train: {len(train_custom_ids)} custom_ids ({len(train_indices)} samples)")
         print(f"Val: {len(val_custom_ids)} custom_ids ({len(val_indices)} samples)")
         print(f"Test: {len(test_custom_ids)} custom_ids ({len(test_indices)} samples)")
-        
+
         train_ds = Subset(self, indices=train_indices)
         val_ds = Subset(self, indices=val_indices)
         test_ds = Subset(self, indices=test_indices)
