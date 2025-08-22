@@ -1,5 +1,14 @@
+# Corrected ft_schedules/giga_aso_ft.yaml
+
+# At epoch 0, unfreeze all randomly initialized parts of the model:
+# The prediction head AND the new chemical/backbone embedding layers.
 0:
     - pred_head.*
+    - chem_embedder.*
+    - backbone_embedder.*
+
+# At epoch 3, begin unfreezing the top layers of the pre-trained language model
+# to fine-tune it for the specific task.
 3:
     - lm.transformer.final_layer_norm.*
     - lm.transformer.blocks.([1-9]+[0-9]+|[6-9]+).*
