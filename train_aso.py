@@ -286,6 +286,8 @@ def main(args):
     if args.checkpoint_every_epoch:
         callbacks.append(ModelCheckpoint(dirpath=args.output_dir, filename='aso-epoch_ckpt-{epoch}-{step}', every_n_epochs=1, save_top_k=-1))
     callbacks.append(ModelCheckpoint(dirpath=args.output_dir, filename='aso-best-{epoch}-{val/mae_final:.2f}', monitor='val/mae_final', mode='min', save_top_k=1))
+    callbacks.append(ModelCheckpoint(save_last=True))
+
     if loggers: callbacks.append(LearningRateMonitor(logging_interval="step"))
     if args.ft_schedule: callbacks.append(GradualUnfreezing(unfreeze_schedule_path=args.ft_schedule))
 
@@ -302,6 +304,7 @@ def main(args):
     if not args.test_only:
         trainer.fit(model=model, datamodule=datamodule)
     trainer.test(model=model, datamodule=datamodule)
+    
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
