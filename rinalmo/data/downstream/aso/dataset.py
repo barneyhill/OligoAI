@@ -24,6 +24,8 @@ class ASODataset(Dataset):
         # Convert DNA to RNA (T -> U)
         self.df['rna_sequence'] = self.df['aso_sequence_5_to_3'].str.replace('T', 'U')
 
+        self.df['rna_context'] = self.df['rna_context'].fillna('')
+
         # Filter out any rows with missing inhibition values
         self.df = self.df.dropna(subset=['inhibition_percent'])
 
