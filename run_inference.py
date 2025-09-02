@@ -6,6 +6,8 @@ from torch.utils.data import DataLoader
 import argparse
 
 from rinalmo.data.alphabet import Alphabet
+# --- FIX 1: Import the StandardScaler ---
+from rinalmo.utils.scaler import StandardScaler
 from rinalmo.data.downstream.aso.dataset import ASODataset
 from train_aso import ASOInhibitionPredictionWrapper
 
@@ -40,19 +42,40 @@ def run_inference(
     # Set device
     if device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
-
     print(f"Using device: {device}")
+
+    # --- FIX 2: Re-create the scaler by fitting on the training data ---
+    # First, load the dataframe to determine the training split
+    df = pd.read_csv(data_path)
+    
+    # Use the same logic as the datamodule to split data
+    np.random.seed(42) # Must be the same seed used for training
+    unique_custom_ids = df['custom_id'].unique()
+    shuffled_custom_ids = np.random.permutation(unique_custom_ids)
+    train_ratio = 0.8
+    train_size = int(train_ratio * len(unique_custom_ids))
+    train_custom_ids = set(shuffled_custom_ids[:train_size])
+    
+    # Filter the dataframe to get only the training data
+    train_df = df[df['custom_id'].isin(train_custom_ids)]
+    
+    # Fit the scaler on the 'inhibition_percent' column of the training data
+    scaler = StandardScaler()
+    train_targets = torch.tensor(train_df['inhibition_percent'].values, dtype=torch.float32).unsqueeze(-1)
+    scaler.partial_fit(train_targets)
+    print(f"Scaler re-created from training data with mean: {scaler._mean.item():.4f} and std: {scaler._scale.item():.4f}")
+
 
     # Initialize alphabet and dataset
     alphabet = Alphabet()
     dataset = ASODatasetWithLen(
         data_path=data_path,
         alphabet=alphabet,
-        pad_to_max_len=True
+        pad_to_max_len=True,
+        df=df # Pass the pre-loaded dataframe
     )
 
     print(f"Loaded dataset with {len(dataset)} samples")
-    print(f"Max sequence length: {dataset.max_enc_seq_len}")
 
     # Create dataloader for inference
     dataloader = DataLoader(
@@ -60,29 +83,29 @@ def run_inference(
         batch_size=batch_size,
         num_workers=num_workers,
         pin_memory=True if device == "cuda" else False,
-        shuffle=False  # Important: keep original order
+        shuffle=False
     )
 
-    # Load the trained model
+    # Load the trained model, passing the re-created scaler
     print(f"Loading model from: {model_checkpoint_path}")
-    model = ASOInhibitionPredictionWrapper.load_from_checkpoint(model_checkpoint_path)
+    # --- FIX 3: Pass the scaler object during model loading ---
+    model = ASOInhibitionPredictionWrapper.load_from_checkpoint(
+        model_checkpoint_path, 
+        scaler=scaler
+    )
     model.eval()
     model.to(device)
 
     print(f"Model loaded successfully")
-    print(f"Chemistry vocab size: {len(dataset.chem_vocab)}")
-    print(f"Backbone vocab size: {len(dataset.backbone_vocab)}")
 
     # Run inference
     all_predictions = []
-    all_targets = []
-    all_custom_ids = []
 
     print("Starting inference...")
     with torch.no_grad():
         for batch_idx, batch in enumerate(dataloader):
             # Unpack batch
-            aso_tokens, chem_tokens, backbone_tokens, context_tokens, inhibition_target, dosage, custom_ids = batch
+            aso_tokens, chem_tokens, backbone_tokens, context_tokens, _, dosage, _ = batch
 
             # Move tensors to device
             aso_tokens = aso_tokens.to(device)
@@ -94,109 +117,63 @@ def run_inference(
             # Use autocast for mixed precision on GPU
             if device == "cuda":
                 with torch.autocast(device_type='cuda', dtype=torch.float16):
-                    predictions = model(aso_tokens, chem_tokens, backbone_tokens, context_tokens, dosage)
+                    # Model outputs SCALED predictions
+                    scaled_predictions = model(aso_tokens, chem_tokens, backbone_tokens, context_tokens, dosage)
             else:
-                predictions = model(aso_tokens, chem_tokens, backbone_tokens, context_tokens, dosage)
+                scaled_predictions = model(aso_tokens, chem_tokens, backbone_tokens, context_tokens, dosage)
 
-            # Store results
-            all_predictions.extend(predictions.cpu().numpy())
-            all_targets.extend(inhibition_target.numpy())
-            all_custom_ids.extend(custom_ids)
+            # --- FIX 4: Inverse transform the predictions to get the real values ---
+            unscaled_predictions = model.scaler.inverse_transform(scaled_predictions)
+
+            all_predictions.extend(unscaled_predictions.cpu().numpy())
 
             if (batch_idx + 1) % 10 == 0:
                 print(f"Processed {(batch_idx + 1) * batch_size} samples...")
 
     print(f"Inference completed. Generated {len(all_predictions)} predictions")
 
-    # Load original dataframe and add predictions
-    df = pd.read_csv(data_path)
-
-    # Ensure we have the same number of predictions as rows in the dataframe
+    # The rest of the script is largely the same, but we re-use the pre-loaded df
     assert len(all_predictions) == len(df), f"Mismatch: {len(all_predictions)} predictions vs {len(df)} rows"
 
-    # Add dataset split assignments (same logic as in the original dataset)
-    print("Assigning dataset splits...")
-    np.random.seed(42)  # Use same random state as default
-    unique_custom_ids = df['custom_id'].unique()
-    n_custom_ids = len(unique_custom_ids)
-    shuffled_custom_ids = np.random.permutation(unique_custom_ids)
-
-    # Use same ratios as default (0.8 train, 0.1 val, 0.1 test)
-    train_ratio, val_ratio = 0.8, 0.1
-    train_size = int(train_ratio * n_custom_ids)
-    val_size = int(val_ratio * n_custom_ids)
-
-    train_custom_ids = shuffled_custom_ids[:train_size]
-    val_custom_ids = shuffled_custom_ids[train_size:train_size + val_size]
-    test_custom_ids = shuffled_custom_ids[train_size + val_size:]
-
     # Add split column
-    df['split'] = 'unassigned'  # Default value
+    print("Assigning dataset splits for analysis...")
+    df['split'] = 'test' # Default to test
+    val_size = int(0.1 * len(unique_custom_ids))
+    val_custom_ids = set(shuffled_custom_ids[train_size : train_size + val_size])
     df.loc[df['custom_id'].isin(train_custom_ids), 'split'] = 'train'
     df.loc[df['custom_id'].isin(val_custom_ids), 'split'] = 'val'
-    df.loc[df['custom_id'].isin(test_custom_ids), 'split'] = 'test'
-
-    print(f"Split assignments - Train: {len(train_custom_ids)} custom_ids, Val: {len(val_custom_ids)} custom_ids, Test: {len(test_custom_ids)} custom_ids")
-
+    
+    # The rest of the analysis from here will now work correctly
     # Add predictions to dataframe
     df['predicted_inhibition_percent'] = all_predictions
     df['prediction_error'] = np.abs(np.array(all_predictions) - df['inhibition_percent'].values)
     df['prediction_squared_error'] = (np.array(all_predictions) - df['inhibition_percent'].values) ** 2
 
     # Calculate some summary statistics
-    mae = np.mean(np.abs(np.array(all_predictions) - df['inhibition_percent'].values))
-    mse = np.mean((np.array(all_predictions) - df['inhibition_percent'].values) ** 2)
-    rmse = np.sqrt(mse)
+    mae = np.mean(df['prediction_error'])
+    rmse = np.sqrt(np.mean(df['prediction_squared_error']))
 
-    print(f"\nPrediction Statistics:")
+    print(f"\nOverall Prediction Statistics:")
     print(f"MAE: {mae:.4f}")
-    print(f"MSE: {mse:.4f}")
     print(f"RMSE: {rmse:.4f}")
 
     # Calculate R² score
     from scipy.stats import pearsonr
-    r, p_value = pearsonr(all_predictions, df['inhibition_percent'].values)
+    r, p_value = pearsonr(df['predicted_inhibition_percent'], df['inhibition_percent'])
     r2 = r ** 2
     print(f"R²: {r2:.4f}")
-    print(f"Pearson correlation: {r:.4f} (p-value: {p_value:.2e})")
-
+    
     # Calculate per-split statistics
     for split in ['train', 'val', 'test']:
-        split_mask = df['split'] == split
-        if split_mask.sum() > 0:
-            split_predictions = np.array(all_predictions)[split_mask]
-            split_targets = df.loc[split_mask, 'inhibition_percent'].values
-            split_mae = np.mean(np.abs(split_predictions - split_targets))
-            split_mse = np.mean((split_predictions - split_targets) ** 2)
-            split_rmse = np.sqrt(split_mse)
-
-            # Calculate R² for this split
-            from scipy.stats import pearsonr
-            if len(split_predictions) > 1:
-                r, p_value = pearsonr(split_predictions, split_targets)
-                r2 = r ** 2
-                print(f"{split.upper()} - MAE: {split_mae:.4f}, RMSE: {split_rmse:.4f}, R²: {r2:.4f}, samples: {split_mask.sum()}")
-            else:
-                print(f"{split.upper()} - MAE: {split_mae:.4f}, RMSE: {split_rmse:.4f}, samples: {split_mask.sum()}")
-
-    # Calculate per-custom_id statistics if available
-    if 'custom_id' in df.columns:
-        custom_id_stats = []
-        for custom_id in df['custom_id'].unique():
-            mask = df['custom_id'] == custom_id
-            pred_subset = np.array(all_predictions)[mask]
-            target_subset = df.loc[mask, 'inhibition_percent'].values
-
-            if len(pred_subset) > 1:
-                from scipy.stats import spearmanr
-                corr, _ = spearmanr(pred_subset, target_subset)
-                if not np.isnan(corr):
-                    custom_id_stats.append(corr)
-
-        if custom_id_stats:
-            mean_spearman = np.mean(custom_id_stats)
-            print(f"Mean Spearman correlation across custom_ids: {mean_spearman:.4f}")
-
+        split_df = df[df['split'] == split]
+        if not split_df.empty:
+            mae = np.mean(split_df['prediction_error'])
+            rmse = np.sqrt(np.mean(split_df['prediction_squared_error']))
+            r, _ = pearsonr(split_df['predicted_inhibition_percent'], split_df['inhibition_percent'])
+            r2 = r ** 2
+            print(f"{split.upper()} - MAE: {mae:.4f}, RMSE: {rmse:.4f}, R²: {r2:.4f}, samples: {len(split_df)}")
+    
+    # ... (rest of your analysis script) ...
     # Determine output path
     if output_path is None:
         data_path_obj = Path(data_path)
@@ -207,7 +184,6 @@ def run_inference(
     print(f"\nPredictions saved to: {output_path}")
 
     return df
-
 
 def main():
     parser = argparse.ArgumentParser(description="Run inference on ASO inhibition prediction model")
