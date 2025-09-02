@@ -27,37 +27,73 @@ from rinalmo.data.downstream.aso.datamodule import ASODataModule
 from rinalmo.utils.scaler import StandardScaler
 from rinalmo.utils.finetune_callback import GradualUnfreezing
 
-class ASOContextInteractionHead(nn.Module):
+class AttentionPooling(nn.Module):
     """
-    Performs cross-attention in a lower-dimensional bottleneck space
-    to reduce parameters and prevent overfitting.
+    Performs attention-based pooling on a sequence of token representations.
+    It learns a weighted average of the token representations, allowing the model
+    to focus on the most relevant parts of the sequence.
+    """
+    def __init__(self, embed_dim: int):
+        super().__init__()
+        # A small network to compute attention scores for each token
+        self.attention_net = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim // 2),
+            nn.Tanh(),
+            nn.Linear(embed_dim // 2, 1)
+        )
+
+    def forward(self, representations: torch.Tensor, pad_mask: torch.Tensor):
+        """
+        representations: [batch_size, seq_len, embed_dim]
+        pad_mask: [batch_size, seq_len]
+        """
+        # Get attention scores for each token
+        # -> [batch_size, seq_len, 1]
+        attn_scores = self.attention_net(representations)
+        
+        # Mask out the padded tokens by setting their scores to a very low value
+        mask_value = torch.finfo(attn_scores.dtype).min
+        attn_scores.masked_fill_(pad_mask.unsqueeze(-1), mask_value)
+ 
+        # Apply softmax to get attention weights
+        # -> [batch_size, seq_len, 1]
+        attn_weights = F.softmax(attn_scores, dim=1)
+        
+        # Compute the weighted sum of the representations
+        # (batch, seq_len, embed_dim) * (batch, seq_len, 1) -> sum over seq_len
+        # -> [batch_size, embed_dim]
+        pooled_repr = (representations * attn_weights).sum(dim=1)
+        
+        return pooled_repr
+
+
+class ASOPredictionHead(nn.Module):
+    """
+    Combines ASO and context representations via pooling and concatenation,
+    then predicts inhibition using an MLP. This structure is robust to
+    missing context.
     """
     def __init__(
         self,
         c_in_aso: int,
         c_in_context: int,
-        bottleneck_dim: int = 128,
-        num_heads: int = 8,
         hidden_dim: int = 128,
         num_layers: int = 3,
         dropout: float = 0.1,
     ):
         super().__init__()
+        
+        # Use attention pooling for both ASO and context
+        self.aso_pooler = AttentionPooling(c_in_aso)
+        self.context_pooler = AttentionPooling(c_in_context)
 
-        self.q_proj = nn.Linear(c_in_aso, bottleneck_dim)
-        self.k_proj = nn.Linear(c_in_context, bottleneck_dim)
-        self.v_proj = nn.Linear(c_in_context, bottleneck_dim)
-
-        self.cross_attn = nn.MultiheadAttention(
-            embed_dim=bottleneck_dim,
-            num_heads=num_heads,
-            dropout=dropout,
-            batch_first=True
-        )
+        # The input dimension for the MLP will be the sum of the pooled ASO and context
+        # representation dimensions, plus one dimension for the dosage.
+        mlp_in_dim = c_in_aso + c_in_context + 1
 
         mlp_layers = []
         for i in range(num_layers):
-            in_dim = bottleneck_dim + 1 if i == 0 else hidden_dim
+            in_dim = mlp_in_dim if i == 0 else hidden_dim
             out_dim = 1 if i == num_layers - 1 else hidden_dim
             mlp_layers.append(nn.Linear(in_dim, out_dim))
             if i < num_layers - 1:
@@ -66,15 +102,14 @@ class ASOContextInteractionHead(nn.Module):
         self.mlp = nn.Sequential(*mlp_layers)
 
     def forward(self, aso_repr, context_repr, aso_pad_mask, context_pad_mask, dosage):
-        q = self.q_proj(aso_repr)
-        k = self.k_proj(context_repr)
-        v = self.v_proj(context_repr)
-        context_aware_aso_repr, _ = self.cross_attn(
-            query=q, key=k, value=v, key_padding_mask=context_pad_mask,
-        )
-        lengths = (~aso_pad_mask).sum(dim=1, keepdim=True).float()
-        pooled_repr = context_aware_aso_repr.sum(dim=1) / lengths.clamp(min=1.0)
-        combined_input = torch.cat([pooled_repr, dosage.unsqueeze(-1)], dim=-1)
+        # Pool the ASO and context representations using attention
+        pooled_aso_repr = self.aso_pooler(aso_repr, aso_pad_mask)
+        pooled_context_repr = self.context_pooler(context_repr, context_pad_mask)
+        
+        # Concatenate the pooled representations and dosage
+        combined_input = torch.cat([pooled_aso_repr, pooled_context_repr, dosage.unsqueeze(-1)], dim=-1)
+        
+        # Pass through the MLP
         out = self.mlp(combined_input)
         return out.squeeze(-1)
 
@@ -86,16 +121,16 @@ class ASOInhibitionPredictionWrapper(pl.LightningModule):
         chem_embed_dim: int,
         backbone_vocab_size: int,
         backbone_embed_dim: int,
-        num_heads: int,
         hidden_dim: int,
         num_layers: int,
         dropout: float,
         lr: float,
+        scaler: StandardScaler,
     ):
         super().__init__()
-        self.save_hyperparameters()
+        self.save_hyperparameters(ignore=['scaler'])
+        self.scaler = scaler
 
-        self.scaler = StandardScaler()
         self.lm = RiNALMo(model_config(lm_config))
         lm_embed_dim = self.lm.config['model']['transformer'].embed_dim
 
@@ -106,12 +141,16 @@ class ASOInhibitionPredictionWrapper(pl.LightningModule):
             num_embeddings=backbone_vocab_size, embedding_dim=backbone_embed_dim, padding_idx=0
         )
 
+        # A small network to better integrate sequence, chemistry, and backbone features
         c_in_aso_combined = lm_embed_dim + chem_embed_dim + backbone_embed_dim
+        self.aso_feature_combiner = nn.Sequential(
+            nn.Linear(c_in_aso_combined, lm_embed_dim),
+            nn.ReLU()
+        )
 
-        self.pred_head = ASOContextInteractionHead(
-            c_in_aso=c_in_aso_combined,
+        self.pred_head = ASOPredictionHead(
+            c_in_aso=lm_embed_dim, # Now using the output dim of the combiner
             c_in_context=lm_embed_dim,
-            num_heads=num_heads,
             hidden_dim=hidden_dim,
             num_layers=num_layers,
             dropout=dropout
@@ -132,38 +171,50 @@ class ASOInhibitionPredictionWrapper(pl.LightningModule):
 
     def forward(self, aso_tokens, chem_tokens, backbone_tokens, context_tokens, dosage):
         aso_repr = self.lm(aso_tokens)["representation"]
-        context_repr = self.lm(context_tokens)["representation"]
+        context_repr_original = self.lm(context_tokens)["representation"] # Renamed for clarity
 
         chem_embeds = self.chem_embedder(chem_tokens)
         backbone_embeds = self.backbone_embedder(backbone_tokens)
 
-        combined_aso_repr = torch.cat([aso_repr, chem_embeds, backbone_embeds], dim=-1)
+        # Concatenate raw features
+        combined_aso_repr_raw = torch.cat([aso_repr, chem_embeds, backbone_embeds], dim=-1)
+        
+        # Pass through the feature combiner to get a richer representation
+        combined_aso_repr_original = self.aso_feature_combiner(combined_aso_repr_raw) # Renamed
 
         aso_pad_mask = aso_tokens.eq(self.pad_idx)
         context_pad_mask = context_tokens.eq(self.pad_idx)
 
-        combined_aso_repr[aso_pad_mask, :] = 0.0
-        context_repr[context_pad_mask, :] = 0.0
+        aso_token_mask = (~aso_pad_mask).unsqueeze(-1).to(combined_aso_repr_original.dtype)
+        combined_aso_repr = combined_aso_repr_original * aso_token_mask
 
+        context_token_mask = (~context_pad_mask).unsqueeze(-1).to(context_repr_original.dtype)
+        context_repr = context_repr_original * context_token_mask
+
+        # Now, combined_aso_repr and context_repr are new tensors, and the originals
+        # (which are needed for the backward pass) are preserved.
         pred = self.pred_head(combined_aso_repr, context_repr, aso_pad_mask, context_pad_mask, dosage)
         return pred
 
-    def fit_scaler(self, batch):
-        _, _, _, _, inhibition, _, _ = batch
-        self.scaler.partial_fit(inhibition)
-
     def _common_step(self, batch, batch_idx, log_prefix: str):
         aso_tokens, chem_tokens, backbone_tokens, context_tokens, inhibition_target, dosage, custom_ids = batch
-        preds = self(aso_tokens, chem_tokens, backbone_tokens, context_tokens, dosage)
-        loss = self.loss(preds, inhibition_target)
-        mse = F.mse_loss(preds, inhibition_target)
-        mae = F.l1_loss(preds, inhibition_target)
-        self.r2_metric.update(preds, inhibition_target)
-        self.mae_metric.update(preds, inhibition_target)
-        self.rmse_metric.update(preds, inhibition_target)
-        log = { f'{log_prefix}/loss': loss, f'{log_prefix}/mse': mse, f'{log_prefix}/mae': mae }
+        
+        # Scale targets for stable training
+        scaled_target = self.scaler.transform(inhibition_target)
+
+        preds_scaled = self(aso_tokens, chem_tokens, backbone_tokens, context_tokens, dosage)
+        loss = self.loss(preds_scaled, scaled_target)
+        
+        # For logging and metrics, use the original scale
+        preds_unscaled = self.scaler.inverse_transform(preds_scaled.detach())
+
+        self.r2_metric.update(preds_unscaled, inhibition_target)
+        self.mae_metric.update(preds_unscaled, inhibition_target)
+        self.rmse_metric.update(preds_unscaled, inhibition_target)
+        
+        log = { f'{log_prefix}/loss': loss }
         self.log_dict(log, sync_dist=True)
-        return loss, preds, inhibition_target, custom_ids
+        return loss, preds_unscaled, inhibition_target, custom_ids
 
     def _eval_step(self, batch, batch_idx, log_prefix, data_collector):
         loss, preds_percent, inhibition_percent, custom_ids = self._common_step(batch, batch_idx, log_prefix=log_prefix)
@@ -171,8 +222,10 @@ class ASOInhibitionPredictionWrapper(pl.LightningModule):
             data_collector[custom_id]['preds'].append(pred)
             data_collector[custom_id]['targets'].append(target)
         return loss
+
     def _on_eval_epoch_start(self):
         self.r2_metric.reset(); self.mae_metric.reset(); self.rmse_metric.reset()
+
     def _calculate_mean_spearman_correlation(self, data_by_custom_id):
         correlations = []
         for custom_id, data in data_by_custom_id.items():
@@ -183,28 +236,16 @@ class ASOInhibitionPredictionWrapper(pl.LightningModule):
         return np.mean(correlations) if correlations else 0.0, len(correlations)
 
     def _calculate_top_pred_target_ratio(self, data_by_custom_id):
-        """
-        For each custom_id:
-        1. Find the prediction with highest inhibition value
-        2. Get the corresponding target value
-        3. Divide by mean of all targets for that custom_id
-        4. Return median of these ratios across all custom_ids
-        """
         ratios = []
         for custom_id, data in data_by_custom_id.items():
             preds, targets = np.array(data['preds']), np.array(data['targets'])
             if len(preds) > 0:
-                # Find index of highest prediction
                 top_pred_idx = np.argmax(preds)
-                # Get corresponding target value
                 top_pred_target = targets[top_pred_idx]
-                # Calculate mean of all targets for this custom_id
                 mean_target = np.mean(targets)
-                # Calculate ratio (avoid division by zero)
                 if mean_target != 0:
                     ratio = top_pred_target / mean_target
                     ratios.append(ratio)
-
         return np.median(ratios) if ratios else 0.0, len(ratios)
 
     def _on_eval_epoch_end(self, log_prefix: str, data_collector):
@@ -220,22 +261,42 @@ class ASOInhibitionPredictionWrapper(pl.LightningModule):
             print(f"{log_prefix} - Top pred target ratio (median): {top_pred_ratio:.4f} across {n_ratios} custom_ids")
             self.r2_metric.reset(); self.mae_metric.reset(); self.rmse_metric.reset()
         data_collector.clear()
+
     def training_step(self, batch, batch_idx):
-        if self.current_epoch == 0: return self.fit_scaler(batch)
         loss, _, _, _ = self._common_step(batch, batch_idx, log_prefix="train")
         return loss
+        
     def validation_step(self, batch, batch_idx):
         return self._eval_step(batch, batch_idx, log_prefix="val", data_collector=self.val_data_by_custom_id)
+        
     def on_validation_epoch_start(self): return self._on_eval_epoch_start()
     def on_validation_epoch_end(self): return self._on_eval_epoch_end("val", self.val_data_by_custom_id)
+    
     def test_step(self, batch, batch_idx):
         return self._eval_step(batch, batch_idx, log_prefix="test", data_collector=self.test_data_by_custom_id)
+        
     def on_test_epoch_start(self): return self._on_eval_epoch_start()
     def on_test_epoch_end(self): return self._on_eval_epoch_end("test", self.test_data_by_custom_id)
+    
     def configure_optimizers(self):
         optimizer = Adam(filter(lambda p: p.requires_grad, self.parameters()), lr=self.lr)
-        scheduler = LinearLR(optimizer, start_factor=1.0, end_factor=0.1, total_iters=5000)
-        return {"optimizer": optimizer, "lr_scheduler": {"scheduler": scheduler, "interval": "step"}}
+        
+        # Dynamically configure the scheduler based on trainer settings
+        if self.trainer.max_steps and self.trainer.max_steps > 0:
+            total_steps = self.trainer.max_steps
+        else:
+            total_steps = self.trainer.estimated_stepping_batches
+
+        print(f"Configuring LinearLR scheduler with total_iters = {total_steps}")
+        scheduler = LinearLR(optimizer, start_factor=1.0, end_factor=0.1, total_iters=total_steps)
+        
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "step"
+            }
+        }
 
 def main(args):
     if args.seed:
@@ -249,13 +310,18 @@ def main(args):
         num_workers=args.num_workers, pin_memory=args.pin_memory, train_ratio=args.train_ratio,
         val_ratio=args.val_ratio, random_state=args.seed if args.seed else 42,
     )
-
     datamodule.setup(stage='fit')
+    
+    # --- Correct Scaler Fitting ---
+    # 1. Instantiate the scaler
+    scaler = StandardScaler()
+    # 2. Extract all target values from the training dataset
+    print("Fitting StandardScaler on the training data...")
+    train_targets = [item[4] for item in datamodule.train_dataset]
+    # 3. Fit the scaler on the entire training set
+    scaler.partial_fit(torch.tensor(train_targets, dtype=torch.float32).unsqueeze(-1))
 
-    # ### FIXED: Changed datamodule.train_ds to datamodule.train_dataset ###
-    # This matches the attribute name defined in the ASODataModule class.
     train_dataset = datamodule.train_dataset.dataset
-
     chem_vocab_size = len(train_dataset.chem_vocab)
     backbone_vocab_size = len(train_dataset.backbone_vocab)
     print(f"Chemistry vocab size: {chem_vocab_size}, Backbone vocab size: {backbone_vocab_size}")
@@ -266,11 +332,11 @@ def main(args):
         chem_embed_dim=args.chem_embed_dim,
         backbone_vocab_size=backbone_vocab_size,
         backbone_embed_dim=args.backbone_embed_dim,
-        num_heads=args.num_heads,
         hidden_dim=args.hidden_dim,
         num_layers=args.num_layers,
         dropout=args.dropout,
         lr=args.lr,
+        scaler=scaler, # 4. Pass the fitted scaler to the model
     )
 
     if args.pretrained_rinalmo_weights:
@@ -284,9 +350,23 @@ def main(args):
         wandb_logger = WandbLogger(name=args.wandb_experiment_name, save_dir=args.output_dir, project=args.wandb_project, entity=args.wandb_entity, save_code=True)
         loggers.append(wandb_logger)
     if args.checkpoint_every_epoch:
-        callbacks.append(ModelCheckpoint(dirpath=args.output_dir, filename='aso-epoch_ckpt-{epoch}-{step}', every_n_epochs=1, save_top_k=-1))
-    callbacks.append(ModelCheckpoint(dirpath=args.output_dir, filename='aso-best-{epoch}-{val/mae_final:.2f}', monitor='val/mae_final', mode='min', save_top_k=1))
-    callbacks.append(ModelCheckpoint(save_last=True))
+        # Save all epochs (includes best and last)
+        callbacks.append(ModelCheckpoint(
+            dirpath=args.output_dir, 
+            filename='aso-epoch_ckpt-{epoch}-{step}', 
+            every_n_epochs=1, 
+            save_top_k=-1
+        ))
+    else:
+        # Only save best and last when not saving everything
+        callbacks.append(ModelCheckpoint(
+            dirpath=args.output_dir, 
+            filename='aso-best-{epoch}-{val/mae_final:.2f}', 
+            monitor='val/mae_final', 
+            mode='min', 
+            save_top_k=1
+        ))
+        callbacks.append(ModelCheckpoint(save_last=True))
 
     if loggers: callbacks.append(LearningRateMonitor(logging_interval="step"))
     if args.ft_schedule: callbacks.append(GradualUnfreezing(unfreeze_schedule_path=args.ft_schedule))
@@ -300,11 +380,10 @@ def main(args):
         gradient_clip_val=args.gradient_clip_val, precision=args.precision, default_root_dir=args.output_dir,
         log_every_n_steps=args.log_every_n_steps, strategy=strategy, logger=loggers, callbacks=callbacks,
     )
-
+    
     if not args.test_only:
         trainer.fit(model=model, datamodule=datamodule)
     trainer.test(model=model, datamodule=datamodule)
-    
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -318,7 +397,7 @@ if __name__ == "__main__":
     parser.add_argument("--pretrained_rinalmo_weights", type=str, default=None)
     parser.add_argument("--chem_embed_dim", type=int, default=16, help="Dimension for chemistry embeddings")
     parser.add_argument("--backbone_embed_dim", type=int, default=8, help="Dimension for backbone embeddings")
-    parser.add_argument("--num_heads", type=int, default=8)
+    # --num_heads argument removed as it is no longer used
     parser.add_argument("--hidden_dim", type=int, default=128)
     parser.add_argument("--num_layers", type=int, default=3)
     parser.add_argument("--dropout", type=float, default=0.1)
