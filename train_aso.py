@@ -1,3 +1,4 @@
+root@837c7570ea86:/RiNALMo# cat train_aso.py
 import torch
 import torch.nn.functional as F
 import torch.nn as nn
@@ -50,46 +51,46 @@ class AttentionPooling(nn.Module):
         # Get attention scores for each token
         # -> [batch_size, seq_len, 1]
         attn_scores = self.attention_net(representations)
-        
+
         # Mask out the padded tokens by setting their scores to a very low value
         mask_value = torch.finfo(attn_scores.dtype).min
         attn_scores.masked_fill_(pad_mask.unsqueeze(-1), mask_value)
- 
+
         # Apply softmax to get attention weights
         # -> [batch_size, seq_len, 1]
         attn_weights = F.softmax(attn_scores, dim=1)
-        
+
         # Compute the weighted sum of the representations
         # (batch, seq_len, embed_dim) * (batch, seq_len, 1) -> sum over seq_len
         # -> [batch_size, embed_dim]
         pooled_repr = (representations * attn_weights).sum(dim=1)
-        
+
         return pooled_repr
 
 
 class ASOPredictionHead(nn.Module):
     """
     Combines ASO and context representations via pooling and concatenation,
-    then predicts inhibition using an MLP. This structure is robust to
-    missing context.
+    then predicts inhibition using an MLP. Uses method-scaled dosage instead
+    of separate dosage and method inputs.
     """
     def __init__(
         self,
         c_in_aso: int,
         c_in_context: int,
+        transfection_method_embed_dim: int,
         hidden_dim: int = 128,
         num_layers: int = 3,
         dropout: float = 0.1,
     ):
         super().__init__()
-        
+
         # Use attention pooling for both ASO and context
         self.aso_pooler = AttentionPooling(c_in_aso)
         self.context_pooler = AttentionPooling(c_in_context)
 
-        # The input dimension for the MLP will be the sum of the pooled ASO and context
-        # representation dimensions, plus one dimension for the dosage.
-        mlp_in_dim = c_in_aso + c_in_context + 1
+        # The input dimension for the MLP: pooled representations + method-scaled dosage
+        mlp_in_dim = c_in_aso + c_in_context + transfection_method_embed_dim
 
         mlp_layers = []
         for i in range(num_layers):
@@ -101,14 +102,14 @@ class ASOPredictionHead(nn.Module):
                 mlp_layers.append(nn.Dropout(dropout))
         self.mlp = nn.Sequential(*mlp_layers)
 
-    def forward(self, aso_repr, context_repr, aso_pad_mask, context_pad_mask, dosage):
+    def forward(self, aso_repr, context_repr, aso_pad_mask, context_pad_mask, method_scaled_dosage):
         # Pool the ASO and context representations using attention
         pooled_aso_repr = self.aso_pooler(aso_repr, aso_pad_mask)
         pooled_context_repr = self.context_pooler(context_repr, context_pad_mask)
-        
-        # Concatenate the pooled representations and dosage
-        combined_input = torch.cat([pooled_aso_repr, pooled_context_repr, dosage.unsqueeze(-1)], dim=-1)
-        
+
+        # Concatenate the pooled representations and method-scaled dosage
+        combined_input = torch.cat([pooled_aso_repr, pooled_context_repr, method_scaled_dosage], dim=-1)
+
         # Pass through the MLP
         out = self.mlp(combined_input)
         return out.squeeze(-1)
@@ -121,6 +122,8 @@ class ASOInhibitionPredictionWrapper(pl.LightningModule):
         chem_embed_dim: int,
         backbone_vocab_size: int,
         backbone_embed_dim: int,
+        transfection_method_vocab_size: int,
+        transfection_method_embed_dim: int,
         hidden_dim: int,
         num_layers: int,
         dropout: float,
@@ -141,6 +144,11 @@ class ASOInhibitionPredictionWrapper(pl.LightningModule):
             num_embeddings=backbone_vocab_size, embedding_dim=backbone_embed_dim, padding_idx=0
         )
 
+        # Transfection method embedder - no padding needed for scalar categorical
+        self.transfection_method_embedder = nn.Embedding(
+            num_embeddings=transfection_method_vocab_size, embedding_dim=transfection_method_embed_dim
+        )
+
         # A small network to better integrate sequence, chemistry, and backbone features
         c_in_aso_combined = lm_embed_dim + chem_embed_dim + backbone_embed_dim
         self.aso_feature_combiner = nn.Sequential(
@@ -149,8 +157,9 @@ class ASOInhibitionPredictionWrapper(pl.LightningModule):
         )
 
         self.pred_head = ASOPredictionHead(
-            c_in_aso=lm_embed_dim, # Now using the output dim of the combiner
+            c_in_aso=lm_embed_dim,
             c_in_context=lm_embed_dim,
+            transfection_method_embed_dim=transfection_method_embed_dim,
             hidden_dim=hidden_dim,
             num_layers=num_layers,
             dropout=dropout
@@ -169,18 +178,23 @@ class ASOInhibitionPredictionWrapper(pl.LightningModule):
     def load_pretrained_lm_weights(self, pretrained_weights_path):
         self.lm.load_state_dict(torch.load(pretrained_weights_path))
 
-    def forward(self, aso_tokens, chem_tokens, backbone_tokens, context_tokens, dosage):
+    def forward(self, aso_tokens, chem_tokens, backbone_tokens, context_tokens, dosage, transfection_method_tokens):
         aso_repr = self.lm(aso_tokens)["representation"]
-        context_repr_original = self.lm(context_tokens)["representation"] # Renamed for clarity
+        context_repr_original = self.lm(context_tokens)["representation"]
 
         chem_embeds = self.chem_embedder(chem_tokens)
         backbone_embeds = self.backbone_embedder(backbone_tokens)
 
+        # Get transfection method embedding and scale by dosage
+        transfection_method_embeds = self.transfection_method_embedder(transfection_method_tokens)
+        # Scale the method embedding by dosage: [batch_size, embed_dim] * [batch_size, 1] -> [batch_size, embed_dim]
+        method_scaled_dosage = transfection_method_embeds * dosage.unsqueeze(-1)
+
         # Concatenate raw features
         combined_aso_repr_raw = torch.cat([aso_repr, chem_embeds, backbone_embeds], dim=-1)
-        
+
         # Pass through the feature combiner to get a richer representation
-        combined_aso_repr_original = self.aso_feature_combiner(combined_aso_repr_raw) # Renamed
+        combined_aso_repr_original = self.aso_feature_combiner(combined_aso_repr_raw)
 
         aso_pad_mask = aso_tokens.eq(self.pad_idx)
         context_pad_mask = context_tokens.eq(self.pad_idx)
@@ -191,27 +205,26 @@ class ASOInhibitionPredictionWrapper(pl.LightningModule):
         context_token_mask = (~context_pad_mask).unsqueeze(-1).to(context_repr_original.dtype)
         context_repr = context_repr_original * context_token_mask
 
-        # Now, combined_aso_repr and context_repr are new tensors, and the originals
-        # (which are needed for the backward pass) are preserved.
-        pred = self.pred_head(combined_aso_repr, context_repr, aso_pad_mask, context_pad_mask, dosage)
+        # Pass method-scaled dosage to prediction head
+        pred = self.pred_head(combined_aso_repr, context_repr, aso_pad_mask, context_pad_mask, method_scaled_dosage)
         return pred
 
     def _common_step(self, batch, batch_idx, log_prefix: str):
-        aso_tokens, chem_tokens, backbone_tokens, context_tokens, inhibition_target, dosage, custom_ids = batch
-        
+        aso_tokens, chem_tokens, backbone_tokens, context_tokens, inhibition_target, dosage, transfection_method_tokens, custom_ids = batch
+
         # Scale targets for stable training
         scaled_target = self.scaler.transform(inhibition_target)
 
-        preds_scaled = self(aso_tokens, chem_tokens, backbone_tokens, context_tokens, dosage)
+        preds_scaled = self(aso_tokens, chem_tokens, backbone_tokens, context_tokens, dosage, transfection_method_tokens)
         loss = self.loss(preds_scaled, scaled_target)
-        
+
         # For logging and metrics, use the original scale
         preds_unscaled = self.scaler.inverse_transform(preds_scaled.detach())
 
         self.r2_metric.update(preds_unscaled, inhibition_target)
         self.mae_metric.update(preds_unscaled, inhibition_target)
         self.rmse_metric.update(preds_unscaled, inhibition_target)
-        
+
         log = { f'{log_prefix}/loss': loss }
         self.log_dict(log, sync_dist=True)
         return loss, preds_unscaled, inhibition_target, custom_ids
@@ -265,22 +278,22 @@ class ASOInhibitionPredictionWrapper(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         loss, _, _, _ = self._common_step(batch, batch_idx, log_prefix="train")
         return loss
-        
+
     def validation_step(self, batch, batch_idx):
         return self._eval_step(batch, batch_idx, log_prefix="val", data_collector=self.val_data_by_custom_id)
-        
+
     def on_validation_epoch_start(self): return self._on_eval_epoch_start()
     def on_validation_epoch_end(self): return self._on_eval_epoch_end("val", self.val_data_by_custom_id)
-    
+
     def test_step(self, batch, batch_idx):
         return self._eval_step(batch, batch_idx, log_prefix="test", data_collector=self.test_data_by_custom_id)
-        
+
     def on_test_epoch_start(self): return self._on_eval_epoch_start()
     def on_test_epoch_end(self): return self._on_eval_epoch_end("test", self.test_data_by_custom_id)
-    
+
     def configure_optimizers(self):
         optimizer = Adam(filter(lambda p: p.requires_grad, self.parameters()), lr=self.lr)
-        
+
         # Dynamically configure the scheduler based on trainer settings
         if self.trainer.max_steps and self.trainer.max_steps > 0:
             total_steps = self.trainer.max_steps
@@ -289,7 +302,7 @@ class ASOInhibitionPredictionWrapper(pl.LightningModule):
 
         print(f"Configuring LinearLR scheduler with total_iters = {total_steps}")
         scheduler = LinearLR(optimizer, start_factor=1.0, end_factor=0.1, total_iters=total_steps)
-        
+
         return {
             "optimizer": optimizer,
             "lr_scheduler": {
@@ -311,7 +324,7 @@ def main(args):
         val_ratio=args.val_ratio, random_state=args.seed if args.seed else 42,
     )
     datamodule.setup(stage='fit')
-    
+
     # --- Correct Scaler Fitting ---
     # 1. Instantiate the scaler
     scaler = StandardScaler()
@@ -324,7 +337,10 @@ def main(args):
     train_dataset = datamodule.train_dataset.dataset
     chem_vocab_size = len(train_dataset.chem_vocab)
     backbone_vocab_size = len(train_dataset.backbone_vocab)
+    transfection_method_vocab_size = len(train_dataset.transfection_method_vocab)
+
     print(f"Chemistry vocab size: {chem_vocab_size}, Backbone vocab size: {backbone_vocab_size}")
+    print(f"Transfection method vocab size: {transfection_method_vocab_size}")
 
     model = ASOInhibitionPredictionWrapper(
         lm_config=args.lm_config,
@@ -332,11 +348,13 @@ def main(args):
         chem_embed_dim=args.chem_embed_dim,
         backbone_vocab_size=backbone_vocab_size,
         backbone_embed_dim=args.backbone_embed_dim,
+        transfection_method_vocab_size=transfection_method_vocab_size,
+        transfection_method_embed_dim=args.transfection_method_embed_dim,
         hidden_dim=args.hidden_dim,
         num_layers=args.num_layers,
         dropout=args.dropout,
         lr=args.lr,
-        scaler=scaler, # 4. Pass the fitted scaler to the model
+        scaler=scaler,
     )
 
     if args.pretrained_rinalmo_weights:
@@ -352,18 +370,18 @@ def main(args):
     if args.checkpoint_every_epoch:
         # Save all epochs (includes best and last)
         callbacks.append(ModelCheckpoint(
-            dirpath=args.output_dir, 
-            filename='aso-epoch_ckpt-{epoch}-{step}', 
-            every_n_epochs=1, 
+            dirpath=args.output_dir,
+            filename='aso-epoch_ckpt-{epoch}-{step}',
+            every_n_epochs=1,
             save_top_k=-1
         ))
     else:
         # Only save best and last when not saving everything
         callbacks.append(ModelCheckpoint(
-            dirpath=args.output_dir, 
-            filename='aso-best-{epoch}-{val/mae_final:.2f}', 
-            monitor='val/mae_final', 
-            mode='min', 
+            dirpath=args.output_dir,
+            filename='aso-best-{epoch}-{val/mae_final:.2f}',
+            monitor='val/mae_final',
+            mode='min',
             save_top_k=1
         ))
         callbacks.append(ModelCheckpoint(save_last=True))
@@ -380,7 +398,7 @@ def main(args):
         gradient_clip_val=args.gradient_clip_val, precision=args.precision, default_root_dir=args.output_dir,
         log_every_n_steps=args.log_every_n_steps, strategy=strategy, logger=loggers, callbacks=callbacks,
     )
-    
+
     if not args.test_only:
         trainer.fit(model=model, datamodule=datamodule)
     trainer.test(model=model, datamodule=datamodule)
@@ -397,7 +415,7 @@ if __name__ == "__main__":
     parser.add_argument("--pretrained_rinalmo_weights", type=str, default=None)
     parser.add_argument("--chem_embed_dim", type=int, default=16, help="Dimension for chemistry embeddings")
     parser.add_argument("--backbone_embed_dim", type=int, default=8, help="Dimension for backbone embeddings")
-    # --num_heads argument removed as it is no longer used
+    parser.add_argument("--transfection_method_embed_dim", type=int, default=4, help="Dimension for transfection method embeddings")
     parser.add_argument("--hidden_dim", type=int, default=128)
     parser.add_argument("--num_layers", type=int, default=3)
     parser.add_argument("--dropout", type=float, default=0.1)
