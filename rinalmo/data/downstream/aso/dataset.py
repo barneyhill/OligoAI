@@ -34,6 +34,16 @@ class ASODataset(Dataset):
         self.df['sugar_mods'] = self.df['sugar_mods'].apply(ast.literal_eval)
         self.df['backbone_mods'] = self.df['backbone_mods'].apply(ast.literal_eval)
 
+        self.transfection_method_vocab = {
+            'Electroporation': 0,
+            'Gymnosis': 1,
+            'Other': 2,
+            'Lipofection': 3,
+        }
+
+        print("Using Transfection Method Vocabulary:", self.transfection_method_vocab)
+
+
         self.df = self.df.reset_index(drop=True)
 
         # Calculate median dosage for imputation
@@ -124,7 +134,12 @@ class ASODataset(Dataset):
         dosage = torch.tensor(dosage, dtype=torch.float32)
         custom_id = df_row['custom_id']
 
-        # Update the return statement with the new tensors
+        transfection_method_encoded = torch.tensor(
+            self.transfection_method_vocab.get(df_row['transfection_method'], 0),  # Default to pad if unknown
+            dtype=torch.long
+        )
+
+        # Update the return statement to include transfection method:
         return (
             seq_encoded,
             chem_encoded,
@@ -132,9 +147,9 @@ class ASODataset(Dataset):
             context_encoded,
             inhibition,
             dosage,
+            transfection_method_encoded,  # Add this line
             custom_id
         )
-
     def train_val_test_split(self, train_ratio: float = 0.8, val_ratio: float = 0.1, random_state: int = 42):
         np.random.seed(random_state)
         unique_custom_ids = self.df['custom_id'].unique()
