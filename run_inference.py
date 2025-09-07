@@ -47,7 +47,7 @@ def run_inference(
     # --- FIX 2: Re-create the scaler by fitting on the training data ---
     # First, load the dataframe to determine the training split
     df = pd.read_csv(data_path)
-    
+
     # Use the same logic as the datamodule to split data
     np.random.seed(42) # Must be the same seed used for training
     unique_custom_ids = df['custom_id'].unique()
@@ -55,16 +55,14 @@ def run_inference(
     train_ratio = 0.8
     train_size = int(train_ratio * len(unique_custom_ids))
     train_custom_ids = set(shuffled_custom_ids[:train_size])
-    
+
     # Filter the dataframe to get only the training data
     train_df = df[df['custom_id'].isin(train_custom_ids)]
-    
+
     # Fit the scaler on the 'inhibition_percent' column of the training data
     scaler = StandardScaler()
     train_targets = torch.tensor(train_df['inhibition_percent'].values, dtype=torch.float32).unsqueeze(-1)
     scaler.partial_fit(train_targets)
-    print(f"Scaler re-created from training data with mean: {scaler._mean.item():.4f} and std: {scaler._scale.item():.4f}")
-
 
     # Initialize alphabet and dataset
     alphabet = Alphabet()
@@ -72,7 +70,6 @@ def run_inference(
         data_path=data_path,
         alphabet=alphabet,
         pad_to_max_len=True,
-        df=df # Pass the pre-loaded dataframe
     )
 
     print(f"Loaded dataset with {len(dataset)} samples")
@@ -90,7 +87,7 @@ def run_inference(
     print(f"Loading model from: {model_checkpoint_path}")
     # --- FIX 3: Pass the scaler object during model loading ---
     model = ASOInhibitionPredictionWrapper.load_from_checkpoint(
-        model_checkpoint_path, 
+        model_checkpoint_path,
         scaler=scaler
     )
     model.eval()
@@ -104,8 +101,8 @@ def run_inference(
     print("Starting inference...")
     with torch.no_grad():
         for batch_idx, batch in enumerate(dataloader):
-            # Unpack batch
-            aso_tokens, chem_tokens, backbone_tokens, context_tokens, _, dosage, _ = batch
+            # --- FIX 4: Unpack batch including transfection method tokens ---
+            aso_tokens, chem_tokens, backbone_tokens, context_tokens, _, dosage, transfection_method_tokens, _ = batch
 
             # Move tensors to device
             aso_tokens = aso_tokens.to(device)
@@ -113,16 +110,18 @@ def run_inference(
             backbone_tokens = backbone_tokens.to(device)
             context_tokens = context_tokens.to(device)
             dosage = dosage.to(device)
+            transfection_method_tokens = transfection_method_tokens.to(device)
 
             # Use autocast for mixed precision on GPU
             if device == "cuda":
                 with torch.autocast(device_type='cuda', dtype=torch.float16):
+                    # --- FIX 5: Pass transfection method tokens to model ---
                     # Model outputs SCALED predictions
-                    scaled_predictions = model(aso_tokens, chem_tokens, backbone_tokens, context_tokens, dosage)
+                    scaled_predictions = model(aso_tokens, chem_tokens, backbone_tokens, context_tokens, dosage, transfection_method_tokens)
             else:
-                scaled_predictions = model(aso_tokens, chem_tokens, backbone_tokens, context_tokens, dosage)
+                scaled_predictions = model(aso_tokens, chem_tokens, backbone_tokens, context_tokens, dosage, transfection_method_tokens)
 
-            # --- FIX 4: Inverse transform the predictions to get the real values ---
+            # --- FIX 6: Inverse transform the predictions to get the real values ---
             unscaled_predictions = model.scaler.inverse_transform(scaled_predictions)
 
             all_predictions.extend(unscaled_predictions.cpu().numpy())
@@ -142,7 +141,7 @@ def run_inference(
     val_custom_ids = set(shuffled_custom_ids[train_size : train_size + val_size])
     df.loc[df['custom_id'].isin(train_custom_ids), 'split'] = 'train'
     df.loc[df['custom_id'].isin(val_custom_ids), 'split'] = 'val'
-    
+
     # The rest of the analysis from here will now work correctly
     # Add predictions to dataframe
     df['predicted_inhibition_percent'] = all_predictions
@@ -162,7 +161,7 @@ def run_inference(
     r, p_value = pearsonr(df['predicted_inhibition_percent'], df['inhibition_percent'])
     r2 = r ** 2
     print(f"R²: {r2:.4f}")
-    
+
     # Calculate per-split statistics
     for split in ['train', 'val', 'test']:
         split_df = df[df['split'] == split]
@@ -172,7 +171,7 @@ def run_inference(
             r, _ = pearsonr(split_df['predicted_inhibition_percent'], split_df['inhibition_percent'])
             r2 = r ** 2
             print(f"{split.upper()} - MAE: {mae:.4f}, RMSE: {rmse:.4f}, R²: {r2:.4f}, samples: {len(split_df)}")
-    
+
     # ... (rest of your analysis script) ...
     # Determine output path
     if output_path is None:
