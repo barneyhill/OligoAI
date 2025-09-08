@@ -151,45 +151,64 @@ class ASODataset(Dataset):
             custom_id
         )
     def train_val_test_split(self, train_ratio: float = 0.8, val_ratio: float = 0.1, random_state: int = 42):
+        """
+        Split the dataset by patents instead of custom_ids to ensure that all data 
+        from the same patent goes into the same split.
+        """
+        
+        def extract_patent_id(custom_id):
+            """
+            Extract patent ID from custom_id string.
+            Example: 'patent-scrape-v2/data/inhibition_tables/US20230055405A1_table_00014.xml' -> 'US20230055405A1'
+            """
+            # Get the filename part (after last '/')
+            filename = custom_id.split('/')[-1]
+            # Extract patent ID (before '_table_')
+            patent_id = filename.split('_table_')[0]
+            return patent_id
+        
+        # Extract patent IDs from all custom_ids
+        self.df['patent_id'] = self.df['custom_id'].apply(extract_patent_id)
+        
         np.random.seed(random_state)
-        unique_custom_ids = self.df['custom_id'].unique()
-        n_custom_ids = len(unique_custom_ids)
-        shuffled_custom_ids = np.random.permutation(unique_custom_ids)
-
-        train_size = int(train_ratio * n_custom_ids)
-        val_size = int(val_ratio * n_custom_ids)
-
-        train_custom_ids = shuffled_custom_ids[:train_size]
-        val_custom_ids = shuffled_custom_ids[train_size:train_size + val_size]
-        test_custom_ids = shuffled_custom_ids[train_size + val_size:]
-
-        train_indices = self.df[self.df['custom_id'].isin(train_custom_ids)].index.tolist()
-        val_indices = self.df[self.df['custom_id'].isin(val_custom_ids)].index.tolist()
-        test_indices = self.df[self.df['custom_id'].isin(test_custom_ids)].index.tolist()
-
-        print(f"Split by custom_id - Train: {len(train_custom_ids)} custom_ids ({len(train_indices)} samples)")
-        print(f"Val: {len(val_custom_ids)} custom_ids ({len(val_indices)} samples)")
-        print(f"Test: {len(test_custom_ids)} custom_ids ({len(test_indices)} samples)")
-
+        unique_patents = self.df['patent_id'].unique()
+        n_patents = len(unique_patents)
+        shuffled_patents = np.random.permutation(unique_patents)
+    
+        train_size = int(train_ratio * n_patents)
+        val_size = int(val_ratio * n_patents)
+    
+        train_patents = shuffled_patents[:train_size]
+        val_patents = shuffled_patents[train_size:train_size + val_size]
+        test_patents = shuffled_patents[train_size + val_size:]
+    
+        train_indices = self.df[self.df['patent_id'].isin(train_patents)].index.tolist()
+        val_indices = self.df[self.df['patent_id'].isin(val_patents)].index.tolist()
+        test_indices = self.df[self.df['patent_id'].isin(test_patents)].index.tolist()
+    
+        print(f"Split by patent - Train: {len(train_patents)} patents ({len(train_indices)} samples)")
+        print(f"Val: {len(val_patents)} patents ({len(val_indices)} samples)")
+        print(f"Test: {len(test_patents)} patents ({len(test_indices)} samples)")
+    
         # Create a copy of the dataframe to add the split column
         split_df = self.df.copy()
-
+    
         # Add the 'split' column and assign values based on the indices
-        split_df['split'] = 'unassigned' # Default value
+        split_df['split'] = 'unassigned'  # Default value
         split_df.loc[train_indices, 'split'] = 'train'
         split_df.loc[val_indices, 'split'] = 'val'
         split_df.loc[test_indices, 'split'] = 'test'
-
+    
         # Construct the output filename
         output_filename = self.data_path.parent / f"{self.data_path.stem}.withsplit.csv"
-
-        # Save the dataframe with the new 'split' column
+    
+        # Save the dataframe with the new 'split' column (including patent_id column)
         split_df.to_csv(output_filename, index=False)
         print(f"Split assignments saved to: {output_filename}")
-
+    
         # Create Subset objects for PyTorch
         train_ds = Subset(self, indices=train_indices)
         val_ds = Subset(self, indices=val_indices)
         test_ds = Subset(self, indices=test_indices)
-
+    
         return train_ds, val_ds, test_ds
