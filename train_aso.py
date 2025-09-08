@@ -27,44 +27,35 @@ from rinalmo.utils.scaler import StandardScaler
 from rinalmo.utils.finetune_callback import GradualUnfreezing
 
 class AttentionPooling(nn.Module):
-    """
-    Performs attention-based pooling on a sequence of token representations.
-    It learns a weighted average of the token representations, allowing the model
-    to focus on the most relevant parts of the sequence.
-    """
-    def __init__(self, embed_dim: int):
+    """Attention pooling with dimension reduction first to save parameters"""
+    def __init__(self, embed_dim: int, projection_dim: int = 64):
         super().__init__()
-        # A small network to compute attention scores for each token
+        # Project to smaller dimension first
+        self.projection = nn.Linear(embed_dim, projection_dim)
+
+        # Small attention network on projected features
         self.attention_net = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim // 2),
+            nn.Linear(projection_dim, projection_dim // 2),
             nn.Tanh(),
-            nn.Linear(embed_dim // 2, 1)
+            nn.Linear(projection_dim // 2, 1)
         )
 
     def forward(self, representations: torch.Tensor, pad_mask: torch.Tensor):
-        """
-        representations: [batch_size, seq_len, embed_dim]
-        pad_mask: [batch_size, seq_len]
-        """
-        # Get attention scores for each token
-        # -> [batch_size, seq_len, 1]
-        attn_scores = self.attention_net(representations)
+        # Project to smaller dimension
+        proj_repr = self.projection(representations)  # [batch, seq_len, projection_dim]
 
-        # Mask out the padded tokens by setting their scores to a very low value
+        # Get attention scores
+        attn_scores = self.attention_net(proj_repr)
+
+        # Mask and normalize
         mask_value = torch.finfo(attn_scores.dtype).min
         attn_scores.masked_fill_(pad_mask.unsqueeze(-1), mask_value)
-
-        # Apply softmax to get attention weights
-        # -> [batch_size, seq_len, 1]
         attn_weights = F.softmax(attn_scores, dim=1)
 
-        # Compute the weighted sum of the representations
-        # (batch, seq_len, embed_dim) * (batch, seq_len, 1) -> sum over seq_len
-        # -> [batch_size, embed_dim]
+        # Apply attention to ORIGINAL representations (not projected)
         pooled_repr = (representations * attn_weights).sum(dim=1)
 
         return pooled_repr
-
 
 class ASOPredictionHead(nn.Module):
     """
@@ -149,8 +140,13 @@ class ASOInhibitionPredictionWrapper(pl.LightningModule):
 
         # A small network to better integrate sequence, chemistry, and backbone features
         c_in_aso_combined = lm_embed_dim + chem_embed_dim + backbone_embed_dim
+        bottleneck_dim = 128  
+
         self.aso_feature_combiner = nn.Sequential(
-            nn.Linear(c_in_aso_combined, lm_embed_dim),
+            nn.Linear(c_in_aso_combined, bottleneck_dim),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(bottleneck_dim, lm_embed_dim),
             nn.ReLU()
         )
 
