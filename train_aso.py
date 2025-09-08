@@ -22,7 +22,6 @@ from scipy.stats import spearmanr
 from rinalmo.config import model_config
 from rinalmo.model.model import RiNALMo
 from rinalmo.data.alphabet import Alphabet
-# Assuming your new dataset is in datamodule.py which uses the new dataset.py
 from rinalmo.data.downstream.aso.datamodule import ASODataModule
 from rinalmo.utils.scaler import StandardScaler
 from rinalmo.utils.finetune_callback import GradualUnfreezing
@@ -130,7 +129,7 @@ class ASOInhibitionPredictionWrapper(pl.LightningModule):
         scaler: StandardScaler,
     ):
         super().__init__()
-        self.save_hyperparameters(ignore=['scaler'])
+        self.save_hyperparameters()
         self.scaler = scaler
 
         self.lm = RiNALMo(model_config(lm_config))
