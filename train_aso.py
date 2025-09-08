@@ -1,4 +1,3 @@
-root@837c7570ea86:/RiNALMo# cat train_aso.py
 import torch
 import torch.nn.functional as F
 import torch.nn as nn
