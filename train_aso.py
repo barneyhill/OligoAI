@@ -287,16 +287,23 @@ class ASOInhibitionPredictionWrapper(pl.LightningModule):
 
     def configure_optimizers(self):
         optimizer = Adam(filter(lambda p: p.requires_grad, self.parameters()), lr=self.lr)
-
-        # Dynamically configure the scheduler based on trainer settings
+    
+        # Correctly calculate total_steps for the entire training run
         if self.trainer.max_steps and self.trainer.max_steps > 0:
             total_steps = self.trainer.max_steps
+        elif self.trainer.max_epochs and self.trainer.max_epochs > 0:
+            # Use the dataloader to get the number of batches
+            train_dataloader = self.trainer.datamodule.train_dataloader()
+            steps_per_epoch = len(train_dataloader)
+            total_steps = steps_per_epoch * self.trainer.max_epochs
         else:
             total_steps = self.trainer.estimated_stepping_batches
-
+    
         print(f"Configuring LinearLR scheduler with total_iters = {total_steps}")
+        # Consider adding a warm-up phase, which is common for transformers
+        # For simplicity, we'll stick to LinearLR but you could change it.
         scheduler = LinearLR(optimizer, start_factor=1.0, end_factor=0.1, total_iters=total_steps)
-
+    
         return {
             "optimizer": optimizer,
             "lr_scheduler": {
