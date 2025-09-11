@@ -43,20 +43,20 @@ def run_inference_on_kcnt2(
         device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
 
-    # --- MODIFICATION 1: Create a dummy scaler ---
-    # The original model was trained with scaled targets. Since we don't have the
-    # original training data to re-create the exact scaler, we use a dummy scaler
-    # that does not alter the model's output. The resulting scores will be the
-    # model's raw (scaled) predictions.
-    scaler = StandardScaler()
-    scaler._mean = torch.tensor(0.0)
-    scaler._scale = torch.tensor(1.0)
-    print("Created a dummy scaler (mean=0, std=1). The output scores will be the model's raw scaled predictions.")
+    # Load the trained model with its saved scaler
+    print(f"Loading model from: {model_checkpoint_path}")
+    model = ASOInhibitionPredictionWrapper.load_from_checkpoint(
+        model_checkpoint_path
+        # Remove the scaler parameter - use the one saved with the model
+    )
+    model.eval()
+    model.to(device)
+    print(f"Model loaded successfully with saved scaler: {type(model.scaler)}")
 
     # Initialize alphabet and dataset
     alphabet = Alphabet()
     dataset = ASODatasetWithLen(
-        data_path=data_path,  # data_path is not needed as we provide the dataframe directly
+        data_path=data_path,
         alphabet=alphabet,
         pad_to_max_len=True,
     )
@@ -71,16 +71,6 @@ def run_inference_on_kcnt2(
         shuffle=False
     )
 
-    # --- MODIFICATION 3: Load the model with the dummy scaler ---
-    print(f"Loading model from: {model_checkpoint_path}")
-    model = ASOInhibitionPredictionWrapper.load_from_checkpoint(
-        model_checkpoint_path,
-        scaler=scaler
-    )
-    model.eval()
-    model.to(device)
-    print(f"Model loaded successfully")
-
     # Run inference
     all_predictions = []
 
@@ -88,7 +78,8 @@ def run_inference_on_kcnt2(
     with torch.no_grad():
         for batch_idx, batch in enumerate(dataloader):
             # Unpack the batch provided by the ASODataset
-            aso_tokens, chem_tokens, backbone_tokens, context_tokens, _, dosage, _ = batch
+            # Match the format from the original inference script
+            aso_tokens, chem_tokens, backbone_tokens, context_tokens, _, dosage, transfection_method_tokens, _ = batch
 
             # Move tensors to device
             aso_tokens = aso_tokens.to(device)
@@ -96,28 +87,41 @@ def run_inference_on_kcnt2(
             backbone_tokens = backbone_tokens.to(device)
             context_tokens = context_tokens.to(device)
             dosage = dosage.to(device)
+            transfection_method_tokens = transfection_method_tokens.to(device)
 
             # Use autocast for mixed precision on GPU
             if device == "cuda":
                 with torch.autocast(device_type='cuda', dtype=torch.float16):
-                    scaled_predictions = model(aso_tokens, chem_tokens, backbone_tokens, context_tokens, dosage)
+                    scaled_predictions = model(aso_tokens, chem_tokens, backbone_tokens, context_tokens, dosage, transfection_method_tokens)
             else:
-                scaled_predictions = model(aso_tokens, chem_tokens, backbone_tokens, context_tokens, dosage)
+                scaled_predictions = model(aso_tokens, chem_tokens, backbone_tokens, context_tokens, dosage, transfection_method_tokens)
 
-            # With our dummy scaler, inverse_transform returns the same scaled predictions
+            # Inverse transform the predictions to get the real values
             unscaled_predictions = model.scaler.inverse_transform(scaled_predictions)
             all_predictions.extend(unscaled_predictions.cpu().numpy().flatten())
 
             if (batch_idx + 1) % 10 == 0:
                 print(f"Processed {(batch_idx + 1) * batch_size} samples...")
 
-    df = pd.read_csv('KCNT2_expression.csv')
-    # --- MODIFICATION 4: Add new scores column and save results ---
+    print(f"Inference completed. Generated {len(all_predictions)} predictions")
+
+    # Load the original dataframe
+    df = pd.read_csv(data_path)
+    
+    # Verify prediction count matches dataframe
+    assert len(all_predictions) == len(df), f"Mismatch: {len(all_predictions)} predictions vs {len(df)} rows"
+
     # Add predictions to the original dataframe under the requested column name
     df['oligoAI_scores'] = all_predictions
 
+    # Determine output path
+    if output_path is None:
+        data_path_obj = Path(data_path)
+        output_path = data_path_obj.parent / f"{data_path_obj.stem}_w_oligoAI.csv"
+
     # Save results
-    df.to_csv('KCNT2_expression_w_oligoAI.csv', index=False)
+    df.to_csv(output_path, index=False)
+    print(f"Predictions saved to: {output_path}")
 
     return df
 
@@ -128,7 +132,7 @@ def main():
     parser.add_argument("--model_checkpoint", type=str, default="../mae_final=19.03.ckpt",
                         help="Path to the trained model checkpoint")
     parser.add_argument("--output_path", type=str, default=None,
-                        help="Path to save the CSV with predictions (default: <input_file>_with_oligoAI_scores.csv)")
+                        help="Path to save the CSV with predictions (default: <input_file>_w_oligoAI.csv)")
     parser.add_argument("--batch_size", type=int, default=32,
                         help="Batch size for inference")
     parser.add_argument("--num_workers", type=int, default=0,
