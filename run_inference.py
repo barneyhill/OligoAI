@@ -6,7 +6,6 @@ from torch.utils.data import DataLoader
 import argparse
 
 from rinalmo.data.alphabet import Alphabet
-# --- FIX 1: Import the StandardScaler ---
 from rinalmo.utils.scaler import StandardScaler
 from rinalmo.data.downstream.aso.dataset import ASODataset
 from train_aso import ASOInhibitionPredictionWrapper
@@ -32,7 +31,7 @@ def run_inference(
 
     Args:
         model_checkpoint_path: Path to the trained model checkpoint
-        data_path: Path to the CSV file used for training
+        data_path: Path to the CSV file with splits
         output_path: Path to save the CSV with predictions (optional)
         batch_size: Batch size for inference
         num_workers: Number of workers for data loading
@@ -44,25 +43,23 @@ def run_inference(
         device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
 
-    # --- FIX 2: Re-create the scaler by fitting on the training data ---
-    # First, load the dataframe to determine the training split
+    # Load the dataframe
     df = pd.read_csv(data_path)
 
-    # Use the same logic as the datamodule to split data
-    np.random.seed(42) # Must be the same seed used for training
-    unique_custom_ids = df['custom_id'].unique()
-    shuffled_custom_ids = np.random.permutation(unique_custom_ids)
-    train_ratio = 0.8
-    train_size = int(train_ratio * len(unique_custom_ids))
-    train_custom_ids = set(shuffled_custom_ids[:train_size])
+    # Print split statistics
+    print("\nDataset split distribution:")
+    print(df['split'].value_counts())
 
-    # Filter the dataframe to get only the training data
-    train_df = df[df['custom_id'].isin(train_custom_ids)]
+    # Load the trained model with its saved scaler
+    print(f"Loading model from: {model_checkpoint_path}")
+    model = ASOInhibitionPredictionWrapper.load_from_checkpoint(
+        model_checkpoint_path
+        # Remove the scaler parameter - use the one saved with the model
+    )
+    model.eval()
+    model.to(device)
 
-    # Fit the scaler on the 'inhibition_percent' column of the training data
-    scaler = StandardScaler()
-    train_targets = torch.tensor(train_df['inhibition_percent'].values, dtype=torch.float32).unsqueeze(-1)
-    scaler.partial_fit(train_targets)
+    print(f"Model loaded successfully with saved scaler: {type(model.scaler)}")
 
     # Initialize alphabet and dataset
     alphabet = Alphabet()
@@ -83,25 +80,12 @@ def run_inference(
         shuffle=False
     )
 
-    # Load the trained model, passing the re-created scaler
-    print(f"Loading model from: {model_checkpoint_path}")
-    # --- FIX 3: Pass the scaler object during model loading ---
-    model = ASOInhibitionPredictionWrapper.load_from_checkpoint(
-        model_checkpoint_path,
-        scaler=scaler
-    )
-    model.eval()
-    model.to(device)
-
-    print(f"Model loaded successfully")
-
     # Run inference
     all_predictions = []
 
-    print("Starting inference...")
+    print("\nStarting inference...")
     with torch.no_grad():
         for batch_idx, batch in enumerate(dataloader):
-            # --- FIX 4: Unpack batch including transfection method tokens ---
             aso_tokens, chem_tokens, backbone_tokens, context_tokens, _, dosage, transfection_method_tokens, _ = batch
 
             # Move tensors to device
@@ -115,13 +99,11 @@ def run_inference(
             # Use autocast for mixed precision on GPU
             if device == "cuda":
                 with torch.autocast(device_type='cuda', dtype=torch.float16):
-                    # --- FIX 5: Pass transfection method tokens to model ---
-                    # Model outputs SCALED predictions
                     scaled_predictions = model(aso_tokens, chem_tokens, backbone_tokens, context_tokens, dosage, transfection_method_tokens)
             else:
                 scaled_predictions = model(aso_tokens, chem_tokens, backbone_tokens, context_tokens, dosage, transfection_method_tokens)
 
-            # --- FIX 6: Inverse transform the predictions to get the real values ---
+            # Inverse transform the predictions to get the real values
             unscaled_predictions = model.scaler.inverse_transform(scaled_predictions)
 
             all_predictions.extend(unscaled_predictions.cpu().numpy())
@@ -131,38 +113,36 @@ def run_inference(
 
     print(f"Inference completed. Generated {len(all_predictions)} predictions")
 
-    # The rest of the script is largely the same, but we re-use the pre-loaded df
+    # Verify prediction count matches dataframe
     assert len(all_predictions) == len(df), f"Mismatch: {len(all_predictions)} predictions vs {len(df)} rows"
 
-    # Add split column
-    print("Assigning dataset splits for analysis...")
-    df['split'] = 'test' # Default to test
-    val_size = int(0.1 * len(unique_custom_ids))
-    val_custom_ids = set(shuffled_custom_ids[train_size : train_size + val_size])
-    df.loc[df['custom_id'].isin(train_custom_ids), 'split'] = 'train'
-    df.loc[df['custom_id'].isin(val_custom_ids), 'split'] = 'val'
-
-    # The rest of the analysis from here will now work correctly
     # Add predictions to dataframe
     df['predicted_inhibition_percent'] = all_predictions
     df['prediction_error'] = np.abs(np.array(all_predictions) - df['inhibition_percent'].values)
     df['prediction_squared_error'] = (np.array(all_predictions) - df['inhibition_percent'].values) ** 2
 
-    # Calculate some summary statistics
+    # Calculate overall statistics
     mae = np.mean(df['prediction_error'])
     rmse = np.sqrt(np.mean(df['prediction_squared_error']))
 
-    print(f"\nOverall Prediction Statistics:")
+    print(f"\n{'='*60}")
+    print(f"Overall Prediction Statistics:")
     print(f"MAE: {mae:.4f}")
     print(f"RMSE: {rmse:.4f}")
 
     # Calculate R² score
-    from scipy.stats import pearsonr
+    from scipy.stats import pearsonr, spearmanr
     r, p_value = pearsonr(df['predicted_inhibition_percent'], df['inhibition_percent'])
     r2 = r ** 2
+    spearman_corr, _ = spearmanr(df['predicted_inhibition_percent'], df['inhibition_percent'])
     print(f"R²: {r2:.4f}")
+    print(f"Pearson correlation: {r:.4f}")
+    print(f"Spearman correlation: {spearman_corr:.4f}")
 
     # Calculate per-split statistics
+    print(f"\n{'='*60}")
+    print("Per-split Statistics:")
+    print(f"{'-'*60}")
     for split in ['train', 'val', 'test']:
         split_df = df[df['split'] == split]
         if not split_df.empty:
@@ -170,9 +150,44 @@ def run_inference(
             rmse = np.sqrt(np.mean(split_df['prediction_squared_error']))
             r, _ = pearsonr(split_df['predicted_inhibition_percent'], split_df['inhibition_percent'])
             r2 = r ** 2
-            print(f"{split.upper()} - MAE: {mae:.4f}, RMSE: {rmse:.4f}, R²: {r2:.4f}, samples: {len(split_df)}")
+            spearman_corr, _ = spearmanr(split_df['predicted_inhibition_percent'], split_df['inhibition_percent'])
 
-    # ... (rest of your analysis script) ...
+            print(f"{split.upper():5} - Samples: {len(split_df):6d}")
+            print(f"        MAE: {mae:.4f}, RMSE: {rmse:.4f}")
+            print(f"        R²: {r2:.4f}, Pearson: {r:.4f}, Spearman: {spearman_corr:.4f}")
+            print(f"{'-'*60}")
+
+    # Calculate mean Spearman correlation per custom_id
+    print(f"\n{'='*60}")
+    print("Group-level Analysis:")
+    correlations = []
+    for custom_id in df['custom_id'].unique():
+        custom_df = df[df['custom_id'] == custom_id]
+        if len(custom_df) > 1:
+            corr, _ = spearmanr(custom_df['predicted_inhibition_percent'], custom_df['inhibition_percent'])
+            if not np.isnan(corr):
+                correlations.append(corr)
+
+    if correlations:
+        mean_spearman = np.mean(correlations)
+        print(f"Mean Spearman correlation across {len(correlations)} custom_ids: {mean_spearman:.4f}")
+
+    # Calculate top prediction target ratio
+    ratios = []
+    for custom_id in df['custom_id'].unique():
+        custom_df = df[df['custom_id'] == custom_id]
+        if len(custom_df) > 0:
+            top_pred_idx = custom_df['predicted_inhibition_percent'].idxmax()
+            top_pred_target = custom_df.loc[top_pred_idx, 'inhibition_percent']
+            mean_target = custom_df['inhibition_percent'].mean()
+            if mean_target != 0:
+                ratio = top_pred_target / mean_target
+                ratios.append(ratio)
+
+    if ratios:
+        median_ratio = np.median(ratios)
+        print(f"Top pred target ratio (median): {median_ratio:.4f} across {len(ratios)} custom_ids")
+
     # Determine output path
     if output_path is None:
         data_path_obj = Path(data_path)
@@ -180,13 +195,15 @@ def run_inference(
 
     # Save results
     df.to_csv(output_path, index=False)
-    print(f"\nPredictions saved to: {output_path}")
+    print(f"\n{'='*60}")
+    print(f"Predictions saved to: {output_path}")
 
     return df
 
+
 def main():
     parser = argparse.ArgumentParser(description="Run inference on ASO inhibition prediction model")
-    parser.add_argument("data_path", type=str, help="Path to the CSV file used for training")
+    parser.add_argument("data_path", type=str, help="Path to the CSV file (preferably with splits)")
     parser.add_argument("--model_checkpoint", type=str, default="../mae_final=19.03.ckpt",
                         help="Path to the trained model checkpoint")
     parser.add_argument("--output_path", type=str, default=None,
