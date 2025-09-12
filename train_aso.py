@@ -26,35 +26,24 @@ from rinalmo.data.downstream.aso.datamodule import ASODataModule
 from rinalmo.utils.scaler import StandardScaler
 from rinalmo.utils.finetune_callback import GradualUnfreezing
 
-class AttentionPooling(nn.Module):
-    """Attention pooling with dimension reduction first to save parameters"""
+class GlobalPooling(nn.Module):
+    """Simple and stable global pooling - inspired by RibosomeLoadingPredictionHead"""
     def __init__(self, embed_dim: int, projection_dim: int = 64):
         super().__init__()
-        # Project to smaller dimension first
-        self.projection = nn.Linear(embed_dim, projection_dim)
-
-        # Small attention network on projected features
-        self.attention_net = nn.Sequential(
-            nn.Linear(projection_dim, projection_dim // 2),
-            nn.Tanh(),
-            nn.Linear(projection_dim // 2, 1)
-        )
-
+        # Optional projection to smaller dimension (can help with computational efficiency)
+        self.projection = nn.Linear(embed_dim, projection_dim) if projection_dim < embed_dim else nn.Identity()
+        self.output_dim = projection_dim if projection_dim < embed_dim else embed_dim
+        
     def forward(self, representations: torch.Tensor, pad_mask: torch.Tensor):
-        # Project to smaller dimension
+        # Project if needed
         proj_repr = self.projection(representations)  # [batch, seq_len, projection_dim]
-
-        # Get attention scores
-        attn_scores = self.attention_net(proj_repr)
-
-        # Mask and normalize
-        mask_value = torch.finfo(attn_scores.dtype).min
-        attn_scores.masked_fill_(pad_mask.unsqueeze(-1), mask_value)
-        attn_weights = F.softmax(attn_scores, dim=1)
-
-        # Apply attention to ORIGINAL representations (not projected)
-        pooled_repr = (representations * attn_weights).sum(dim=1)
-
+        
+        # Mask out padded positions
+        proj_repr = proj_repr.masked_fill(pad_mask.unsqueeze(-1), 0.0)
+        
+        # Simple mean pooling over non-padded tokens
+        pooled_repr = proj_repr.sum(dim=1) / (~pad_mask).sum(dim=1)[:, None]
+        
         return pooled_repr
 
 class ASOPredictionHead(nn.Module):
@@ -71,15 +60,16 @@ class ASOPredictionHead(nn.Module):
         hidden_dim: int = 128,
         num_layers: int = 3,
         dropout: float = 0.1,
+        pooling_projection_dim: int = 64,
     ):
         super().__init__()
 
-        # Use attention pooling for both ASO and context
-        self.aso_pooler = AttentionPooling(c_in_aso)
-        self.context_pooler = AttentionPooling(c_in_context)
+        # Use stable global pooling for both ASO and context
+        self.aso_pooler = GlobalPooling(c_in_aso, pooling_projection_dim)
+        self.context_pooler = GlobalPooling(c_in_context, pooling_projection_dim)
 
         # The input dimension for the MLP: pooled representations + method-scaled dosage
-        mlp_in_dim = c_in_aso + c_in_context + transfection_method_embed_dim
+        mlp_in_dim = self.aso_pooler.output_dim + self.context_pooler.output_dim + transfection_method_embed_dim
 
         mlp_layers = []
         for i in range(num_layers):
@@ -92,7 +82,7 @@ class ASOPredictionHead(nn.Module):
         self.mlp = nn.Sequential(*mlp_layers)
 
     def forward(self, aso_repr, context_repr, aso_pad_mask, context_pad_mask, method_scaled_dosage):
-        # Pool the ASO and context representations using attention
+        # Pool the ASO and context representations using stable global pooling
         pooled_aso_repr = self.aso_pooler(aso_repr, aso_pad_mask)
         pooled_context_repr = self.context_pooler(context_repr, context_pad_mask)
 
@@ -118,6 +108,7 @@ class ASOInhibitionPredictionWrapper(pl.LightningModule):
         dropout: float,
         lr: float,
         scaler: StandardScaler,
+        pooling_projection_dim: int = 64,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -156,7 +147,8 @@ class ASOInhibitionPredictionWrapper(pl.LightningModule):
             transfection_method_embed_dim=transfection_method_embed_dim,
             hidden_dim=hidden_dim,
             num_layers=num_layers,
-            dropout=dropout
+            dropout=dropout,
+            pooling_projection_dim=pooling_projection_dim,
         )
 
         self.loss = nn.MSELoss()
@@ -179,10 +171,13 @@ class ASOInhibitionPredictionWrapper(pl.LightningModule):
         chem_embeds = self.chem_embedder(chem_tokens)
         backbone_embeds = self.backbone_embedder(backbone_tokens)
 
-        # Get transfection method embedding and scale by dosage
+        # Scale dosage using log1p before using it
+        scaled_dosage = torch.log1p(dosage)
+
+        # Get transfection method embedding and scale by log-transformed dosage
         transfection_method_embeds = self.transfection_method_embedder(transfection_method_tokens)
         # Scale the method embedding by dosage: [batch_size, embed_dim] * [batch_size, 1] -> [batch_size, embed_dim]
-        method_scaled_dosage = transfection_method_embeds * dosage.unsqueeze(-1)
+        method_scaled_dosage = transfection_method_embeds * scaled_dosage.unsqueeze(-1)
 
         # Concatenate raw features
         combined_aso_repr_raw = torch.cat([aso_repr, chem_embeds, backbone_embeds], dim=-1)
@@ -356,6 +351,7 @@ def main(args):
         dropout=args.dropout,
         lr=args.lr,
         scaler=scaler,
+        pooling_projection_dim=args.pooling_projection_dim,
     )
 
     if args.pretrained_rinalmo_weights:
@@ -420,6 +416,7 @@ if __name__ == "__main__":
     parser.add_argument("--hidden_dim", type=int, default=128)
     parser.add_argument("--num_layers", type=int, default=3)
     parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--pooling_projection_dim", type=int, default=64, help="Dimension for pooling projection")
     parser.add_argument("--train_ratio", type=float, default=0.8)
     parser.add_argument("--val_ratio", type=float, default=0.1)
     parser.add_argument("--wandb", action="store_true", default=False)
