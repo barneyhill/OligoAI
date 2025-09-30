@@ -27,3 +27,9 @@ python3 train_aso.py ./data/aso_inhibitions_21_08_25_incl_context_w_flank_50_df.
             --ft_schedule ft_schedules/giga_sec_struct_ft.yaml \
             --seed 1
 ```
+
+## Inference code
+
+```python
+python3 run_inference.py --model_path OligoAI_11_09_25.ckpt
+```
