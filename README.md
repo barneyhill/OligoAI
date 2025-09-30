@@ -1,5 +1,11 @@
 # OligoAI
 
+## Pretrained model download
+
+https://huggingface.co/barneyhill/OligoAI
+
+## Training code
+
 ```python
 bash install.sh
 python3 train_aso.py ./data/aso_inhibitions_21_08_25_incl_context_w_flank_50_df.csv.gz \
